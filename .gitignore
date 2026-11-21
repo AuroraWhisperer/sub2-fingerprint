@@ -1,0 +1,10 @@
+/dist/
+/bin/
+/config.json
+/config.local.json
+/data/
+/.env*
+*.partial
+*.exe
+*.test
+__pycache__/

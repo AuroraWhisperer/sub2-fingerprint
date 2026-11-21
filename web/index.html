@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="x-dns-prefetch-control" content="off" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>模型指纹检测 · Sub2API</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"><i></i></span
+        ><span>Sub2API <b>/</b> ModelTrace</span>
+      </div>
+      <button id="logout" type="button" class="quiet" hidden>退出登录</button>
+    </header>
+    <main>
+      <h1>模型指纹检测</h1>
+      <div id="notice" role="status" aria-live="polite" hidden></div>
+      <noscript>请启用 JavaScript 以使用检测页面和本地评分。</noscript>
+      <section
+        id="auth"
+        class="panel narrow"
+        aria-labelledby="authTitle"
+        hidden
+      >
+        <h2 id="authTitle">登录 Sub2API</h2>
+        <p class="muted" id="authHint">
+          使用管理员账号读取服务器上的 OpenAI 账号。
+        </p>
+        <form id="loginForm">
+          <label class="field"
+            >邮箱<input
+              type="email"
+              name="email"
+              required
+              maxlength="254"
+              autocomplete="username" /></label
+          ><label class="field"
+            >密码<input
+              type="password"
+              name="password"
+              required
+              maxlength="1024"
+              autocomplete="current-password" /></label
+          ><button class="primary" type="submit">登录</button>
+        </form>
+        <form id="twoForm" hidden>
+          <label class="field"
+            >登录验证码<input
+              type="text"
+              inputmode="numeric"
+              name="code"
+              pattern="[0-9]{6}"
+              required
+              maxlength="6"
+              autocomplete="one-time-code" /></label
+          ><button class="primary" type="submit">验证并登录</button>
+        </form>
+      </section>
+      <section id="desk" class="desk" hidden>
+        <div class="panel config">
+          <div class="panel-title">
+            <h2>新检测</h2>
+            <span class="preset">Astra · 轻度</span>
+          </div>
+          <form id="runForm">
+            <fieldset>
+              <legend>账号</legend>
+              <div class="subhead">
+                <span id="accountInfo">读取账号中…</span
+                ><button type="button" class="link" id="refreshAccounts">
+                  刷新列表
+                </button>
+              </div>
+              <div id="accounts" class="choices"></div>
+            </fieldset>
+            <fieldset>
+              <legend>挑战题</legend>
+              <div class="subhead"><span>任选 1–3 题，每题独立请求</span></div>
+              <div class="choices" id="questions"></div>
+            </fieldset>
+            <div class="action">
+              <label for="parallel">同时检测</label
+              ><select id="parallel">
+                <option value="1">1 个账号</option>
+                <option value="2" disabled>2 个账号</option></select
+              ><button type="submit" class="primary" id="start" disabled>
+                开始检测
+              </button>
+            </div>
+            <p class="footnote" id="estimate">请选择账号。</p>
+          </form>
+          <details class="verify" id="verify">
+            <summary>验证敏感操作</summary>
+            <p class="footnote">
+              Sub2API 要求二次验证时，输入当前管理员的验证码，再开始新的检测。
+            </p>
+            <form id="stepForm" class="inline">
+              <label class="field"
+                >敏感操作验证码<input
+                  type="text"
+                  inputmode="numeric"
+                  name="code"
+                  pattern="[0-9]{6}"
+                  required
+                  maxlength="6"
+                  autocomplete="one-time-code" /></label
+              ><button class="quiet" type="submit">验证</button>
+            </form>
+          </details>
+        </div>
+        <section class="panel results" aria-labelledby="resultTitle">
+          <div class="panel-title">
+            <h2 id="resultTitle">检测结果</h2>
+            <button type="button" id="reloadResults" class="link">刷新</button>
+          </div>
+          <label class="field history"
+            >检测记录<select id="history" aria-label="查看检测记录">
+              <option value="">暂无记录</option>
+            </select></label
+          >
+          <div id="result" aria-busy="false">
+            <p class="empty">
+              完成检测后，在这里查看每个账号的答案与归因概率。
+            </p>
+          </div>
+          <button class="quiet" id="cancel" type="button" hidden>
+            取消剩余请求
+          </button>
+        </section>
+      </section>
+      <button type="button" class="quiet" id="reconnect" hidden>
+        重新连接
+      </button>
+    </main>
+    <footer>
+      <span class="mark mini" aria-hidden="true"><i></i></span>ModelTrace
+      <a href="/ModelTrace-LICENSE.txt">MIT 许可</a>
+      <a
+        class="version"
+        id="version"
+        href="https://github.com/AuroraWhisperer/sub2-fingerprint/releases"
+        target="_blank"
+        rel="noreferrer noopener"
+        hidden
+        >版本与更新</a
+      >
+    </footer>
+  </body>
+</html>
