@@ -1,6 +1,7 @@
 [Unit]
 Description=Private Sub2API ModelTrace detector
-After=network-online.target
+Requires=sub2-fingerprint.socket
+After=sub2-fingerprint.socket network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=3
@@ -11,8 +12,6 @@ User=sub2-fingerprint
 Group=sub2-fingerprint
 WorkingDirectory=/opt/sub2-fingerprint
 ExecStart=/opt/sub2-fingerprint/bin/sub2-fingerprint --config /opt/sub2-fingerprint/config/config.json
-Restart=on-failure
-RestartSec=10
 TimeoutStopSec=15
 UMask=0077
 Nice=10
@@ -27,8 +26,6 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/sub2-fingerprint/data/runs
+Environment=STATE_DIRECTORY=/var/lib/sub2-fingerprint
+ReadWritePaths=/var/lib/sub2-fingerprint
 CapabilityBoundingSet=
-
-[Install]
-WantedBy=multi-user.target

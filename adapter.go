@@ -149,12 +149,16 @@ func (a *Adapter) call(ctx context.Context, method, path, jwt string, payload, d
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Handlers use numeric code + reason; auth middleware uses a string code.
 		var details struct {
-			Reason string          `json:"reason"`
-			Code   json.RawMessage `json:"code"`
+			Reason  string          `json:"reason"`
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
 		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 16<<10)).Decode(&details)
 		if details.Reason == "" {
 			_ = json.Unmarshal(details.Code, &details.Reason)
+		}
+		if path == "/auth/refresh" || path == "/auth/me" {
+			return sessionHTTPFailure(resp.StatusCode, details.Reason, string(details.Code), details.Message)
 		}
 		return adminFailure(resp.StatusCode, details.Reason)
 	}
@@ -215,6 +219,85 @@ func (a *Adapter) Login(ctx context.Context, email, password string) (LoginResul
 func (a *Adapter) Login2FA(ctx context.Context, temp, code string) (LoginResult, error) {
 	return a.login(ctx, "/auth/login/2fa", map[string]string{"temp_token": temp, "totp_code": code})
 }
+
+var (
+	sessionInvalid   = gate("SESSION_INVALID", "Sub2API 登录已失效，请重新登录")
+	accessExpired    = gate("ACCESS_EXPIRED", "Sub2API 访问令牌已到期，需要续期")
+	sessionTemporary = gate("SESSION_TEMPORARY", "暂时无法核对 Sub2API 身份，请稍后重试")
+)
+
+func sessionHTTPFailure(status int, reason, rawCode, message string) error {
+	// Only authoritative auth failures should discard the persistent login. A 401
+	// page from a reverse proxy or a 5xx when Redis is offline proves nothing.
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
+		switch reason {
+		case "TOKEN_EXPIRED", "ACCESS_TOKEN_EXPIRED":
+			return accessExpired
+		case "REFRESH_TOKEN_INVALID", "REFRESH_TOKEN_EXPIRED", "REFRESH_TOKEN_REUSED", "TOKEN_REVOKED", "INVALID_TOKEN", "USER_NOT_FOUND", "USER_INACTIVE", "USER_NOT_ACTIVE", "SESSION_BINDING_MISMATCH":
+			return sessionInvalid
+		}
+		// v0.2.24 returns this ordinary envelope without a reason after a role downgrade.
+		if status == http.StatusForbidden && rawCode == "403" && message == "Backend mode is active. Only admin login is allowed." {
+			return sessionInvalid
+		}
+	}
+	return sessionTemporary
+}
+
+func sessionFault(err error) error {
+	if err == sessionInvalid || err == accessExpired {
+		return err
+	}
+	return sessionTemporary
+}
+
+func panelToken(s string) bool {
+	return len(s) > 0 && len(s) <= 32<<10 && !strings.Contains(s, " ") && headerValue.MatchString(s)
+}
+
+// Refresh rotates the Sub2API administrator session. The response has no identity.
+// Save the pair before VerifyAdmin, so a temporary /auth/me failure can be retried.
+func (a *Adapter) Refresh(ctx context.Context, refresh string) (LoginResult, error) {
+	if !panelToken(refresh) {
+		return LoginResult{}, sessionInvalid
+	}
+	var pair struct {
+		JWT     string `json:"access_token"`
+		Refresh string `json:"refresh_token"`
+		Expires int    `json:"expires_in"`
+		Type    string `json:"token_type"`
+	}
+	if err := a.call(ctx, http.MethodPost, "/auth/refresh", "", map[string]string{"refresh_token": refresh}, &pair); err != nil {
+		return LoginResult{}, sessionFault(err)
+	}
+	if !panelToken(pair.JWT) || !panelToken(pair.Refresh) || pair.Refresh == refresh || pair.Expires <= 0 || int64(pair.Expires) > (1<<63-1)/int64(time.Second) || !strings.EqualFold(pair.Type, "Bearer") {
+		return LoginResult{}, sessionTemporary
+	}
+	return LoginResult{JWT: pair.JWT, Refresh: pair.Refresh, ExpiresIn: pair.Expires}, nil
+}
+
+// VerifyAdmin gets the live, flat user profile for the access token.
+func (a *Adapter) VerifyAdmin(ctx context.Context, jwt string, expectedUserID int64) error {
+	if expectedUserID <= 0 || !panelToken(jwt) {
+		return sessionInvalid
+	}
+	var me struct {
+		ID     int64  `json:"id"`
+		Role   string `json:"role"`
+		Status string `json:"status"`
+	}
+	if err := a.call(ctx, http.MethodGet, "/auth/me", jwt, nil, &me); err != nil {
+		return sessionFault(err)
+	}
+	if me.ID <= 0 || me.Role == "" || me.Status == "" {
+		return sessionTemporary
+	}
+	if me.ID != expectedUserID || me.Role != "admin" || me.Status != "active" {
+		return sessionInvalid
+	}
+	return nil
+}
+
 func (a *Adapter) StepUp(ctx context.Context, jwt, code string) error {
 	var r struct {
 		Verified bool `json:"verified"`

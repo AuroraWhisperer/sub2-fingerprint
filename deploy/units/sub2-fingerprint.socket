@@ -1,0 +1,9 @@
+[Unit]
+Description=Private Sub2API ModelTrace listener
+
+[Socket]
+ListenStream=127.0.0.1:17861
+Accept=no
+
+[Install]
+WantedBy=sockets.target

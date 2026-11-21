@@ -79,6 +79,7 @@ type testBrowser struct {
 	a      *app
 	cookie *http.Cookie
 	csrf   string
+	epoch  string
 }
 
 func (b *testBrowser) call(method, path string, body any, origin string) (int, map[string]any, string) {
@@ -102,6 +103,9 @@ func (b *testBrowser) call(method, path string, body any, origin string) (int, m
 	text := w.Body.String()
 	out := map[string]any{}
 	_ = json.Unmarshal(w.Body.Bytes(), &out)
+	if epoch, ok := out["epoch"].(string); ok {
+		b.epoch = epoch
+	}
 	if csrf, ok := out["csrf"].(string); ok {
 		b.csrf = csrf
 	}
@@ -112,6 +116,7 @@ func (b *testBrowser) post(p string, v any) (int, map[string]any, string) {
 }
 func testApp(t *testing.T) (*app, *isolatedSub2) {
 	t.Helper()
+	t.Setenv("STATE_DIRECTORY", t.TempDir())
 	m := newIsolatedSub2()
 	a, err := newApp(settings{Listen: "127.0.0.1:17861", Data: t.TempDir(), Parallel: 2}, m)
 	if err != nil {
@@ -166,7 +171,7 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 		t.Fatal("reused anonymous session")
 	}
 	qs := a.groups[0]
-	req := RunRequest{ID: "1eee2222-0000-4000-8000-000000000001", Parallel: 2, Accounts: []int64{101, 202, 303}, Questions: []string{qs[0].ID, qs[1].ID}}
+	req := RunRequest{Epoch: b.epoch, ID: "1eee2222-0000-4000-8000-000000000001", Parallel: 2, Accounts: []int64{101, 202, 303}, Questions: []string{qs[0].ID, qs[1].ID}}
 	if c, _, txt := b.post("/api/runs", req); c != 202 {
 		t.Fatal(c, txt)
 	}
@@ -197,9 +202,8 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 		t.Errorf("unexpected upstream calls %v, peak %d", m.calls, m.peakActive)
 	}
 	m.mu.Unlock()
-	raw, _ := os.ReadFile(filepath.Join(a.cfg.Data, req.ID+".json"))
-	if strings.Contains(string(raw), "mock-upstream-login-token") || strings.Contains(string(raw), "fixture-password") || strings.Contains(string(raw), "mock-refresh") {
-		t.Fatal("secret persisted")
+	if _, err := os.Stat(filepath.Join(a.cfg.Data, req.ID+".json")); !os.IsNotExist(err) {
+		t.Fatal("completed answers must only exist in memory")
 	}
 	b.post("/api/logout", map[string]any{})
 	if !m.logout {
@@ -214,51 +218,151 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 		t.Fatal("history owner mismatch")
 	}
 }
-func TestInterruptedIntentNotReplayed(t *testing.T) {
+func TestStaleEpochDoesNotIssueProbe(t *testing.T) {
+	previous, _ := testApp(t)
+	previousBrowser := testBrowser{t: t, a: previous}
+	previousBrowser.call("GET", "/api/session", nil, "")
 	a, m := testApp(t)
+	b := testBrowser{t: t, a: a}
+	b.call("GET", "/api/session", nil, "")
+	if previousBrowser.epoch == "" || previousBrowser.epoch == b.epoch {
+		t.Fatal("expected a new epoch after restart")
+	}
+	if status, _, _ := b.post("/api/login", map[string]string{"email": "admin@example.com", "password": "fixture-password"}); status != http.StatusOK {
+		t.Fatal("login failed", status)
+	}
+	close(m.release)
+	req := RunRequest{ID: "1eee2222-0000-4000-8000-000000000005", Epoch: previousBrowser.epoch, Accounts: []int64{101}, Questions: []string{a.groups[0][0].ID}, Parallel: 1}
+	if status, body, _ := b.post("/api/runs", req); status != http.StatusConflict || body["code"] != "OLD_RUN" {
+		t.Errorf("stale submission got %d, code %v", status, body["code"])
+	}
+	a.queue.wg.Wait()
+	if len(m.calls) != 0 {
+		t.Errorf("stale submission issued upstream probes: %v", m.calls)
+	}
+}
+
+func TestCancelAndRestartClearResults(t *testing.T) {
+	dir := t.TempDir()
+	m := newIsolatedSub2()
+	q, err := openQueue(dir, "fixture-bank", m.Probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(q.close)
 	id := "1eee2222-0000-4000-8000-000000000002"
-	qs := a.groups[0][:2]
-	req := RunRequest{ID: id, Accounts: []int64{101}, Questions: []string{qs[0].ID, qs[1].ID}, Parallel: 1}
-	if err := a.queue.start(context.Background(), 11, "mock", req, map[int64]AccountView{101: m.listed[0]}, qs); err != nil {
+	qs := []Question{{ID: "q1", Prompt: "one"}, {ID: "q2", Prompt: "two"}}
+	req := RunRequest{ID: id, Accounts: []int64{101}, Questions: []string{"q1", "q2"}, Parallel: 1}
+	if err := q.start(context.Background(), 11, "fixture", req, map[int64]AccountView{101: m.listed[0]}, qs); err != nil {
 		t.Fatal(err)
 	}
 	waitStart(t, m)
-	if _, err := a.queue.get(12, id); err == nil {
-		t.Fatal("unauthorized read")
+	if !q.busy() {
+		t.Fatal("queue is working")
 	}
-	if e := a.queue.stopRun(12, id); e == nil {
-		t.Fatal("unauthorized cancellation")
+	if _, err := q.get(12, id); err == nil {
+		t.Fatal("cross-owner read")
 	}
-	if e := a.queue.stopRun(11, id); e != nil {
-		t.Fatal(e)
+	if err := q.stopRun(12, id); err == nil {
+		t.Fatal("cross-owner cancellation")
 	}
-	r := waitRun(t, a.queue, 11, id)
-	if r.State != "cancelled" || r.Rows[1].Status != "cancelled" {
-		t.Fatal("cancellation did not prevent following work")
+	if err := q.stopRun(11, id); err != nil {
+		t.Fatal(err)
 	}
-	a.queue.close()
-	r.State = "running"
-	r.Rows[0].Status = "running"
-	original := &diskRun{Run: *r, Owner: 11}
-	if e := a.queue.save(original); e != nil {
-		t.Fatal(e)
+	r := waitRun(t, q, 11, id)
+	if q.busy() || r.State != "cancelled" || r.Rows[1].Status != "cancelled" {
+		t.Fatal("unexpected cancelled state")
 	}
-	restarted, e := openQueue(a.cfg.Data, a.bankVersion, m.Probe)
-	if e != nil {
-		t.Fatal(e)
+	q.close()
+	restarted, err := openQueue(dir, "fixture-bank", m.Probe)
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer restarted.close()
-	rec, e := restarted.get(11, id)
-	if e != nil || rec.State != "interrupted" || rec.Rows[0].Status != "interrupted" {
-		t.Fatal("restart failed", e)
+	if _, err := restarted.get(11, id); err != errAbsent || len(restarted.history(11)) != 0 {
+		t.Fatal("answers survived restart")
 	}
-	if ok, e := restarted.known(11, req); !ok || e != nil {
-		t.Fatal("idempotency after restart failed")
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 0 {
+		t.Fatal("queue wrote files", err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.calls[101] != 1 {
-		t.Fatal("interrupted task was replayed")
+		t.Fatal("a cancelled question was issued or replayed")
+	}
+}
+
+func TestRetiredAndDuplicateSubmissionsDoNotReplay(t *testing.T) {
+	dir := t.TempDir()
+	calls := 0
+	q, err := openQueue(dir, "fixture-bank", func(ctx context.Context, jwt string, id int64, prompt string) (ProbeAnswer, error) {
+		calls++
+		return ProbeAnswer{Text: "private fixture answer"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.close()
+	accounts := map[int64]AccountView{1: {ID: 1, Name: "demo"}}
+	qs := []Question{{ID: "q", Prompt: "one"}}
+	a := RunRequest{ID: "1eee2222-0000-4000-8000-000000000011", Epoch: "process", Accounts: []int64{1}, Questions: []string{"q"}, Parallel: 1}
+	b := a
+	b.ID = "1eee2222-0000-4000-8000-000000000012"
+	start := func(req RunRequest) error { return q.start(context.Background(), 3, "fixture", req, accounts, qs) }
+	if err := start(a); err != nil {
+		t.Fatal(err)
+	}
+	first := waitRun(t, q, 3, a.ID)
+	if first.Rows[0].Text != "private fixture answer" {
+		t.Fatal("missing answer")
+	}
+	if err := start(a); err != nil {
+		t.Fatal("duplicate submit", err)
+	}
+	changed := a
+	changed.Parallel = 2
+	if err := start(changed); err == nil {
+		t.Fatal("changed parallel accepted")
+	}
+	bad := b
+	bad.Accounts = []int64{2}
+	if err := start(bad); err == nil {
+		t.Fatal("unlisted account accepted")
+	}
+	if _, err := q.get(3, a.ID); err != nil {
+		t.Fatal("invalid new batch erased previous answer")
+	}
+	if err := start(b); err != nil {
+		t.Fatal(err)
+	}
+	waitRun(t, q, 3, b.ID)
+	if _, err := q.get(3, a.ID); err != errAbsent {
+		t.Fatal("old answer still readable")
+	}
+	if _, err := q.get(4, b.ID); err != errAbsent || len(q.history(4)) != 0 {
+		t.Fatal("owner isolation failed")
+	}
+	if summaries := q.history(3); len(summaries) != 1 || summaries[0].ID != b.ID {
+		t.Fatal("old answer still listed")
+	}
+	if err := start(a); err == nil || calls != 2 {
+		t.Fatal("retired request replayed")
+	}
+	// An exhausted ID cache must stop accepting work instead of evicting old IDs.
+	q.mu.Lock()
+	for len(q.seen) < maxSeenSubmissions {
+		q.seen[fmt.Sprint(len(q.seen))] = struct{}{}
+	}
+	q.mu.Unlock()
+	c := a
+	c.ID = "1eee2222-0000-4000-8000-000000000013"
+	if err := start(c); err == nil || calls != 2 {
+		t.Fatal("an ID was evicted")
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 0 {
+		t.Fatal("retired answers persisted", err)
 	}
 }
 func TestSelectionAndOrigin(t *testing.T) {
@@ -266,7 +370,7 @@ func TestSelectionAndOrigin(t *testing.T) {
 	b := testBrowser{t: t, a: a}
 	b.call("GET", "/api/session", nil, "")
 	b.post("/api/login", map[string]string{"email": "admin@example.com", "password": "fixture-password"})
-	req := RunRequest{ID: "1eee2222-0000-4000-8000-000000000003", Accounts: []int64{101}, Parallel: 1, Questions: []string{"freeform prompt"}}
+	req := RunRequest{Epoch: b.epoch, ID: "1eee2222-0000-4000-8000-000000000003", Accounts: []int64{101}, Parallel: 1, Questions: []string{"freeform prompt"}}
 	if c, _, _ := b.post("/api/runs", req); c != 400 {
 		t.Fatal(c)
 	}

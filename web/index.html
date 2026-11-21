@@ -19,6 +19,7 @@
     </header>
     <main>
       <h1>模型指纹检测</h1>
+      <p id="sessionInfo" class="footnote" hidden></p>
       <div id="notice" role="status" aria-live="polite" hidden></div>
       <noscript>请启用 JavaScript 以使用检测页面和本地评分。</noscript>
       <section
@@ -45,8 +46,13 @@
               name="password"
               required
               maxlength="1024"
-              autocomplete="current-password" /></label
-          ><button class="primary" type="submit">登录</button>
+              autocomplete="current-password"
+          /></label>
+          <label class="remember">
+            <input type="checkbox" name="remember" checked />
+            在此浏览器保持登录 7 天
+          </label>
+          <button class="primary" type="submit">登录</button>
         </form>
         <form id="twoForm" hidden>
           <label class="field"
@@ -115,14 +121,12 @@
         </div>
         <section class="panel results" aria-labelledby="resultTitle">
           <div class="panel-title">
-            <h2 id="resultTitle">检测结果</h2>
+            <h2 id="resultTitle">本次检测结果</h2>
             <button type="button" id="reloadResults" class="link">刷新</button>
           </div>
-          <label class="field history"
-            >检测记录<select id="history" aria-label="查看检测记录">
-              <option value="">暂无记录</option>
-            </select></label
-          >
+          <p class="footnote retention">
+            开始下一批检测或服务空闲退出后，服务器会清除本批结果。
+          </p>
           <div id="result" aria-busy="false">
             <p class="empty">
               完成检测后，在这里查看每个账号的答案与归因概率。

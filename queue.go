@@ -4,23 +4,17 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 )
 
 const maxRowsText = 12 << 10
-const historyLimit = 20 << 20
+const maxSeenSubmissions = 1024
 
 var uuidFormat = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-var errHistory = errors.New("检测记录无法安全写入。请检查检测器磁盘空间和权限")
+var errHistory = errors.New("当前检测结果暂不可用")
 var errAbsent = errors.New("未找到检测记录")
 
 func randomID() string {
@@ -39,6 +33,7 @@ type Question struct {
 	Expected int    `json:"expected_count"`
 }
 type RunRequest struct {
+	Epoch     string   `json:"epoch"`
 	ID        string   `json:"id"`
 	Accounts  []int64  `json:"accounts"`
 	Questions []string `json:"questions"`
@@ -70,158 +65,60 @@ type Run struct {
 	Questions   []Question `json:"questions"`
 	Rows        []Row      `json:"rows"`
 }
-type diskRun struct {
-	Owner int64 `json:"owner"`
+type ownedRun struct {
+	owner int64
+	epoch string
 	Run
 }
 type probeFunc func(context.Context, string, int64, string) (ProbeAnswer, error)
-type indexEntry struct {
-	Summary
-	owner int64
-	size  int64
-}
 type queue struct {
-	mu           sync.Mutex
-	dir          string
-	index        map[string]indexEntry
-	total        int64
-	version      string
-	active       *diskRun
-	cancel       context.CancelFunc
-	stopping     bool
-	storageFault bool
-	wg           sync.WaitGroup
-	probe        probeFunc
+	mu       sync.Mutex
+	version  string
+	current  *ownedRun
+	seen     map[string]struct{}
+	cancel   context.CancelFunc
+	stopping bool
+	wg       sync.WaitGroup
+	probe    probeFunc
 }
 
 func nonterminal(s string) bool { return s == "queued" || s == "running" }
-func openQueue(dir, version string, probe probeFunc) (*queue, error) {
-	q := &queue{dir: dir, version: version, index: make(map[string]indexEntry), probe: probe}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, err
-	}
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	for _, f := range files {
-		name := f.Name()
-		if strings.HasSuffix(name, ".partial") && uuidFormat.MatchString(strings.TrimSuffix(name, ".partial")) && f.Type().IsRegular() {
-			if err := os.Remove(filepath.Join(dir, name)); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if !f.Type().IsRegular() || !strings.HasSuffix(name, ".json") || !uuidFormat.MatchString(strings.TrimSuffix(name, ".json")) {
-			return nil, fmt.Errorf("unrecognized file in private result directory")
-		}
-		r, e := q.load(strings.TrimSuffix(name, ".json"))
-		if e != nil {
-			return nil, e
-		}
-		if r.ID+".json" != name || r.Owner < 1 {
-			return nil, errors.New("invalid result owner or id")
-		}
-		info, e := f.Info()
-		if e != nil {
-			return nil, e
-		}
-		q.index[r.ID] = indexEntry{r.Summary, r.Owner, info.Size()}
-		q.total += info.Size()
-		if nonterminal(r.State) {
-			finishRows(r, "interrupted")
-			if e := q.save(r); e != nil {
-				return nil, e
-			}
-		}
-	}
-	return q, nil
+func openQueue(_ string, version string, probe probeFunc) (*queue, error) {
+	return &queue{version: version, probe: probe, seen: make(map[string]struct{})}, nil
 }
-func (q *queue) load(id string) (*diskRun, error) {
-	if !uuidFormat.MatchString(id) {
-		return nil, errAbsent
-	}
-	f, err := os.Open(filepath.Join(q.dir, id+".json"))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil || st.Size() > historyLimit || !st.Mode().IsRegular() {
-		return nil, errHistory
-	}
-	var r diskRun
-	err = json.NewDecoder(f).Decode(&r)
-	return &r, err
-}
-
-// Write a durable intent before dispatch. A recovered intent is marked interrupted and never replayed.
-func (q *queue) save(r *diskRun) error {
-	raw, err := json.Marshal(r)
-	if err != nil {
-		return errHistory
-	}
-	old := q.index[r.ID]
-	if q.total-old.size+int64(len(raw)) > historyLimit {
-		return errHistory
-	}
-	p := filepath.Join(q.dir, r.ID)
-	tmp := p + ".partial"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return errHistory
-	}
-	defer os.Remove(tmp)
-	if _, err = f.Write(raw); err == nil {
-		err = f.Sync()
-	}
-	closeErr := f.Close()
-	if err != nil || closeErr != nil {
-		return errHistory
-	}
-	if err = os.Rename(tmp, p+".json"); err != nil {
-		return errHistory
-	}
-	if err = syncDir(q.dir); err != nil {
-		return errHistory
-	}
-	q.index[r.ID] = indexEntry{r.Summary, r.Owner, int64(len(raw))}
-	q.total += int64(len(raw)) - old.size
-	return nil
+func (q *queue) busy() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.cancel != nil
 }
 func (q *queue) history(owner int64) []Summary {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	out := make([]Summary, 0)
-	for _, e := range q.index {
-		if e.owner == owner {
-			out = append(out, e.Summary)
-		}
+	if q.current == nil || q.current.owner != owner {
+		return []Summary{}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].At > out[j].At })
-	return out
+	return []Summary{q.current.Summary}
 }
 func (q *queue) get(owner int64, id string) (*Run, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	e, ok := q.index[id]
-	if !ok || e.owner != owner {
+	r := q.current
+	if r == nil || r.owner != owner || r.ID != id {
 		return nil, errAbsent
 	}
-	r, err := q.load(id)
-	if err != nil {
-		return nil, errHistory
-	}
-	return &r.Run, nil
+	// Workers can finish while the HTTP handler serializes this snapshot.
+	result := r.Run
+	result.Rows = append([]Row(nil), r.Rows...)
+	result.Questions = append([]Question(nil), r.Questions...)
+	return &result, nil
 }
 func (q *queue) stopRun(owner int64, id string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	e, ok := q.index[id]
-	if !ok || e.owner != owner {
+	if q.current == nil || q.current.ID != id || q.current.owner != owner {
 		return errAbsent
 	}
-	if q.active != nil && q.active.ID == id {
+	if q.cancel != nil {
 		q.cancel()
 	}
 	return nil
@@ -234,8 +131,12 @@ func (q *queue) close() {
 	}
 	q.mu.Unlock()
 	q.wg.Wait()
+	q.mu.Lock()
+	q.current = nil
+	q.seen = nil
+	q.mu.Unlock()
 }
-func finishRows(r *diskRun, state string) {
+func finishRows(r *ownedRun, state string) {
 	r.State = state
 	r.End = nowStamp()
 	for i := range r.Rows {
@@ -262,19 +163,15 @@ func sameSubmission(r *Run, req RunRequest) bool {
 	return true
 }
 func (q *queue) knownLocked(owner int64, req RunRequest) (bool, error) {
-	e, ok := q.index[req.ID]
-	if !ok {
+	if _, ok := q.seen[req.ID]; !ok {
 		return false, nil
 	}
-	if e.owner != owner {
+	r := q.current
+	if r == nil || r.ID != req.ID || r.owner != owner {
 		return true, errAbsent
 	}
-	r, err := q.load(req.ID)
-	if err != nil {
-		return true, errHistory
-	}
-	if !sameSubmission(&r.Run, req) {
-		return true, errors.New("提交编号已用于另一组账号或题目")
+	if r.epoch != req.Epoch || !sameSubmission(&r.Run, req) {
+		return true, errors.New("提交编号已用于不同的检测请求")
 	}
 	return true, nil
 }
@@ -289,16 +186,19 @@ func (q *queue) start(parent context.Context, owner int64, jwt string, req RunRe
 	if ok, e := q.knownLocked(owner, req); ok {
 		return e
 	}
-	if q.stopping || q.storageFault {
-		return errHistory
+	if q.stopping {
+		return errors.New("检测服务正在关闭")
 	}
-	if q.active != nil {
+	if len(q.seen) >= maxSeenSubmissions {
+		return errors.New("本次启动已经达到批次数量上限，请在服务重新启动后重试")
+	}
+	if q.cancel != nil {
 		return errors.New("已有一批检测在运行，请等待完成")
 	}
-	if len(qs) == 0 || len(qs) > 3 || len(req.Accounts) == 0 || len(req.Accounts) > 24 || req.Parallel < 1 || req.Parallel > 2 {
+	if !uuidFormat.MatchString(req.ID) || len(qs) == 0 || len(qs) > 3 || len(req.Accounts) == 0 || len(req.Accounts) > 24 || req.Parallel < 1 || req.Parallel > 2 {
 		return errors.New("检测规模无效")
 	}
-	r := &diskRun{Owner: owner, Run: Run{Summary: Summary{req.ID, nowStamp(), "queued"}, BankVersion: q.version, Parallel: req.Parallel, Questions: qs}}
+	r := &ownedRun{owner: owner, epoch: req.Epoch, Run: Run{Summary: Summary{req.ID, nowStamp(), "queued"}, BankVersion: q.version, Parallel: req.Parallel, Questions: append([]Question(nil), qs...)}}
 	for _, id := range req.Accounts {
 		a, ok := accounts[id]
 		if !ok {
@@ -308,31 +208,16 @@ func (q *queue) start(parent context.Context, owner int64, jwt string, req RunRe
 			r.Rows = append(r.Rows, Row{AccountID: id, Name: a.Name, QuestionID: question.ID, Status: "queued"})
 		}
 	}
-	if q.total+int64(len(r.Rows)*(6*maxRowsText+2048)+16*1024) > historyLimit {
-		return errors.New("结果目录达到容量预算，请先导出并清理旧记录")
-	}
-	if err := q.save(r); err != nil {
-		return err
-	}
 	ctx, cancel := context.WithCancel(parent)
-	q.active = r
+	// Publish only after all validation succeeds. Retired IDs stay consumed.
+	q.seen[req.ID] = struct{}{}
+	q.current = r
 	q.cancel = cancel
 	q.wg.Add(1)
 	go q.execute(ctx, jwt, r)
 	return nil
 }
-func (q *queue) persistLocked(r *diskRun) bool {
-	if q.storageFault {
-		return false
-	}
-	if err := q.save(r); err != nil {
-		q.storageFault = true
-		q.cancel()
-		return false
-	}
-	return true
-}
-func (q *queue) execute(ctx context.Context, jwt string, r *diskRun) {
+func (q *queue) execute(ctx context.Context, jwt string, r *ownedRun) {
 	defer q.wg.Done()
 	jobs := make(chan int)
 	var workers sync.WaitGroup
@@ -362,20 +247,18 @@ send:
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	state := "done"
-	if q.stopping || q.storageFault {
+	if q.stopping {
 		state = "interrupted"
 	} else if ctx.Err() != nil {
 		state = "cancelled"
 	}
 	finishRows(r, state)
-	q.persistLocked(r)
 	q.cancel()
-	q.active = nil
 	q.cancel = nil
 }
-func (q *queue) doRow(ctx context.Context, jwt string, r *diskRun, i int, question Question) bool {
+func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, question Question) bool {
 	q.mu.Lock()
-	if ctx.Err() != nil || q.storageFault {
+	if ctx.Err() != nil {
 		q.mu.Unlock()
 		return false
 	}
@@ -384,11 +267,7 @@ func (q *queue) doRow(ctx context.Context, jwt string, r *diskRun, i int, questi
 	row.Started = nowStamp()
 	row.RequestID = randomID()
 	r.State = "running"
-	saved := q.persistLocked(r)
 	q.mu.Unlock()
-	if !saved {
-		return false
-	}
 	deadline, cancel := context.WithTimeout(ctx, 120*time.Second)
 	answer, err := q.probe(deadline, jwt, row.AccountID, question.Prompt)
 	expired := errors.Is(deadline.Err(), context.DeadlineExceeded)
@@ -430,10 +309,9 @@ func (q *queue) doRow(ctx context.Context, jwt string, r *diskRun, i int, questi
 			r.Rows[j].Error = "同账号上一题失败，已跳过：" + row.Error
 			r.Rows[j].Ended = row.Ended
 		}
-		q.persistLocked(r)
 		return false
 	}
-	return q.persistLocked(r) && ctx.Err() == nil
+	return ctx.Err() == nil
 }
 
 func stopsAccount(code string) bool {

@@ -132,14 +132,18 @@ def atomic_install(src, dest, mode):
             to.flush()
             os.fsync(to.fileno())
         os.replace(tmp, dest)
+        d.sync_dir(dest.parent)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
 
-def running():
-    state = d.system_property('ActiveState')
+def running(unit=None):
+    state = d.system_property('ActiveState', unit)
     d.require(state in ('active', 'inactive', 'failed'), '服务正在切换状态，请稍后再试')
     return state == 'active'
+
+def owned_process(pid):
+    return pid > 0 and os.path.samefile(f'/proc/{pid}/exe', d.ROOT / 'bin' / d.NAME)
 
 def health():
     expected = file_version(d.ROOT / 'VERSION')
@@ -152,7 +156,7 @@ def health():
                       isinstance(payload.get('version'), str) and version(payload['version']) == expected)
             if ok and running():
                 pid = int(d.system_property('MainPID'))
-                if pid > 0 and os.path.samefile(f'/proc/{pid}/exe', d.ROOT / 'bin' / d.NAME):
+                if owned_process(pid):
                     return
         except (ValueError, OSError):
             pass
@@ -163,7 +167,7 @@ class NoRedirect(request.HTTPRedirectHandler):
     def redirect_request(self, *args):
         return None
 
-def snapshot(folder, meta, files, active):
+def snapshot(folder, meta, files, active, enabled, socket_sum):
     # Publish a complete rollback record before changing any installed file.
     with tempfile.TemporaryDirectory(prefix='.sub2-fingerprint-backup-', dir=d.ROOT.parent) as tmp:
         stage = Path(tmp) / 'snapshot'
@@ -176,20 +180,48 @@ def snapshot(folder, meta, files, active):
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(original, backup)
         shutil.copy2(d.UNIT, stage / 'old.service')
-        journal = {'dev': meta['dev'], 'ino': meta['ino'], 'active': active,
+        if meta['format'] == 2:
+            shutil.copy2(d.SOCKET, stage / 'old.socket')
+        journal = {'dev': meta['dev'], 'ino': meta['ino'], 'active': active, 'enabled': enabled,
+                   'socket_sum': socket_sum,
                    'previous': sorted(previous), 'new': sorted(set(files.values()) - previous)}
         d.jwrite(stage / 'journal.json', journal, 0o600)
+        if os.name == 'posix':
+            for entry in sorted(stage.rglob('*'), key=lambda p: len(p.parts), reverse=True):
+                if entry.is_file():
+                    with entry.open('rb') as source:
+                        os.fsync(source.fileno())
+                elif entry.is_dir():
+                    d.sync_dir(entry)
+            d.sync_dir(stage)
         os.rename(stage, folder)
+        d.sync_dir(folder.parent)
+
+def finish_migration(folder):
+    d.purge_legacy_runs()
+    shutil.rmtree(folder)
+
+def enable_as(unit, enabled):
+    d.run('systemctl', 'enable' if enabled else 'disable', unit.name)
 
 def recover(folder):
     d.require(folder.resolve() == folder and d.root_owned(folder, 0o077) and
               not d.mounts_inside(folder), '恢复目录权限或挂载状态无效')
     j = json.loads((folder / 'journal.json').read_text())
     d.require((j['dev'], j['ino']) == (d.ROOT.stat().st_dev, d.ROOT.stat().st_ino), '恢复记录属于另一安装目录')
+    if (folder / 'verified-migration').exists():
+        finish_migration(folder)
+        return
+    old = json.loads((folder / 'old' / d.MARKER.name).read_text())
+    legacy = old['format'] == 1
     for name in j['previous'] + j['new']:
         safe = name in d.ENTRY.values() or name == d.MARKER.name or name.startswith('LICENSES/')
         dest = d.ROOT / name
         d.require(safe and dest == dest.resolve() and d.ROOT in dest.parents, '恢复清单含无效程序路径')
+    if os.path.lexists(d.SOCKET):
+        d.require(d.regular(d.SOCKET) and d.digest(d.SOCKET) in (old.get('socket_sha256'), j['socket_sum']),
+                  '恢复时发现来源不明的 socket 单元')
+        d.run('systemctl', 'disable', '--now', d.SOCKET.name)
     d.run('systemctl', 'stop', d.UNIT.name)
     for name in j['previous']:
         source = folder / 'old' / name
@@ -197,7 +229,7 @@ def recover(folder):
         atomic_install(source, d.ROOT / name, source.stat().st_mode & 0o777)
     for name in j['new']:
         dest = d.ROOT / name
-        d.require(dest == dest.resolve() and d.ROOT in dest.parents and name not in ('config/config.json', d.MARKER.name), '恢复目标无效')
+        d.require(name != d.MARKER.name, '恢复目标无效')
         if dest.exists():
             dest.unlink()
             parent = dest.parent
@@ -205,48 +237,115 @@ def recover(folder):
                 parent.rmdir()
                 parent = parent.parent
     atomic_install(folder / 'old.service', d.UNIT, 0o644)
+    if legacy:
+        if d.SOCKET.exists():
+            d.SOCKET.unlink()
+        state_mark = folder / 'created-state.json'
+        if state_mark.exists() and os.path.lexists(d.STATE):
+            d.remove_state(json.loads(state_mark.read_text()), old['uid'], old['gid'])
+    else:
+        atomic_install(folder / 'old.socket', d.SOCKET, 0o644)
     d.run('systemctl', 'daemon-reload')
+    restored = d.UNIT if legacy else d.SOCKET
+    enable_as(restored, j['enabled'])
     if j['active']:
-        d.run('systemctl', 'start', d.UNIT.name)
+        d.run('systemctl', 'start', restored.name)
         health()
     shutil.rmtree(folder)
 
+def preflight_migration(meta):
+    d.require(meta['format'] == 1 and file_version(d.ROOT / 'VERSION') == (0, 1, 0),
+              '只有 v0.1.0 使用一次性迁移入口')
+    d.unused_unit(d.SOCKET)
+    d.vacant(d.STATE)
+    if running(d.UNIT):
+        pid = int(d.system_property('MainPID', d.UNIT))
+        d.require(owned_process(pid),
+                  '旧版正在运行的进程身份与安装目录不符')
+    else:
+        d.check_port()
+
 def apply(bundle, files, meta, folder):
-    active = running()
-    snapshot(folder, meta, files, active)
+    legacy = meta['format'] == 1
+    old = d.UNIT if legacy else d.SOCKET
+    active = running(old)
+    unit_state = d.system_property('UnitFileState', old)
+    d.require(unit_state in ('enabled', 'disabled'), '单元有特殊启用状态，请先检查')
+    enabled = unit_state == 'enabled'
+    if legacy:
+        preflight_migration(meta)
+    service_src, socket_src = ('units/' + unit.name for unit in (d.UNIT, d.SOCKET))
+    socket_sum = d.digest(bundle / socket_src)
+    snapshot(folder, meta, files, active, enabled, socket_sum)
     try:
-        if active:
-            d.run('systemctl', 'stop', d.UNIT.name)
+        if legacy:
+            state = d.create_state(meta['uid'], meta['gid'])
+            try:
+                d.jwrite(folder / 'created-state.json', state, 0o600)
+            except BaseException:
+                d.remove_state(state, meta['uid'], meta['gid'])
+                raise
+            enable_as(d.UNIT, False)
+        else:
+            state = meta['state']
+            d.run('systemctl', 'stop', d.SOCKET.name)
+        d.run('systemctl', 'stop', d.UNIT.name)
+        d.check_port()
         for src, dest in files.items():
             atomic_install(bundle / src, d.ROOT / dest, 0o755 if src in (d.NAME, 'uninstall.sh', 'update.sh') else 0o644)
-        unit = d.ROOT / files[d.UNIT.name]
-        d.run('systemd-analyze', '--man=no', 'verify', str(unit))
+        unit = d.ROOT / files[service_src]
+        listener = d.ROOT / files[socket_src]
+        d.run('systemd-analyze', '--man=no', 'verify', str(unit), str(listener))
         atomic_install(unit, d.UNIT, 0o644)
-        # Keep ownership of already installed files, including prior license material.
-        updated = dict(meta, unit_sha256=d.digest(d.UNIT), files=sorted(set(meta['files']) | set(files.values())))
+        if legacy:
+            with d.SOCKET.open('xb') as out, listener.open('rb') as inp:
+                shutil.copyfileobj(inp, out)
+            os.chmod(d.SOCKET, 0o644)
+        else:
+            atomic_install(listener, d.SOCKET, 0o644)
+        updated = dict(meta, format=2, state=state, unit_sha256=d.digest(d.UNIT), socket_sha256=socket_sum,
+                       files=sorted(set(meta['files']) | set(files.values())))
         temp_marker = folder / 'new-manifest.json'
         d.jwrite(temp_marker, updated)
         atomic_install(temp_marker, d.MARKER, 0o644)
         d.run('systemctl', 'daemon-reload')
-        if active:
-            d.run('systemctl', 'start', d.UNIT.name)
+        if legacy:
+            enable_as(d.SOCKET, True)
+        if active or legacy:
+            d.run('systemctl', 'start', d.SOCKET.name)
             health()
+        if legacy:
+            d.write_new(folder / 'verified-migration', 'ok', 0o600)
     except BaseException:
         print('新版本未通过。正在恢复原版本。', file=sys.stderr)
         recover(folder)
         raise
-    shutil.rmtree(folder)
-    print('更新完成。' + ('运行中，健康检查通过。' if active else '服务保持停止，启动后可核验健康。'))
+    if legacy:
+        finish_migration(folder)
+    else:
+        shutil.rmtree(folder)
+    print('已切换到按需监听。' if legacy else '已完成手动更新。')
 
 def update(args):
     folder = d.ROOT / '.rollback'
     if args.recover:
         recover(folder)
-        print('已恢复更新前的程序和运行状态。')
+        print('已处理未完成的维护操作。')
         return
     d.require(not os.path.lexists(folder), '存在未完成的更新。请先运行 update.sh --recover')
     meta = d.verify_manifest()
     current = file_version(d.ROOT / 'VERSION')
+    if args.migrate:
+        files = d.bundle_files(d.BUNDLE)
+        d.check_arch(d.BUNDLE / d.NAME)
+        d.require(file_version(d.BUNDLE / 'VERSION') > current, '迁移包版本必须高于已安装版本')
+        preflight_migration(meta)
+        if args.check:
+            print('v0.1.0 迁移预检通过。')
+        else:
+            apply(d.BUNDLE, files, meta, folder)
+        return
+    d.require(meta['format'] == 2, '请在新版解压目录执行 sudo sh ./install.sh --migrate')
     newest = None
     if not args.archive:
         newest, url, sha, size = release_info()
@@ -274,6 +373,7 @@ def update(args):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument('--migrate', action='store_true')
     p.add_argument('--archive')
     p.add_argument('--sha256')
     modes = p.add_mutually_exclusive_group()
@@ -281,7 +381,8 @@ def main():
     modes.add_argument('--recover', action='store_true')
     args = p.parse_args()
     d.require(os.geteuid() == 0, '更新需要 sudo 权限')
-    d.require(Path(__file__).resolve().parent == d.ROOT, '请调用安装目录里的 update.sh')
+    d.require(args.migrate or Path(__file__).resolve().parent == d.ROOT, '请调用安装目录里的 update.sh')
+    d.require(not args.migrate or not (args.archive or args.sha256), '迁移直接核对当前新版解压包')
     with d.maintenance_lock():
         update(args)
 

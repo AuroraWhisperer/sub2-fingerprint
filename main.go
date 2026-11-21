@@ -40,6 +40,8 @@ type settings struct {
 	Data     string `json:"data_dir"`
 }
 type sub2 interface {
+	Refresh(context.Context, string) (LoginResult, error)
+	VerifyAdmin(context.Context, string, int64) error
 	Login(context.Context, string, string) (LoginResult, error)
 	Login2FA(context.Context, string, string) (LoginResult, error)
 	Logout(context.Context, string) error
@@ -47,14 +49,9 @@ type sub2 interface {
 	List(context.Context, string) ([]AccountView, error)
 	Probe(context.Context, string, int64, string) (ProbeAnswer, error)
 }
-type session struct {
-	key, csrf, jwt, refresh, temp string
-	owner                         int64
-	end                           time.Time
-	ctx                           context.Context
-	cancel                        context.CancelFunc
-}
 type app struct {
+	stateDir    string
+	epoch       string
 	cfg         settings
 	api         sub2
 	queue       *queue
@@ -70,6 +67,11 @@ type app struct {
 
 func newApp(cfg settings, api sub2) (*app, error) {
 	a := &app{cfg: cfg, api: api, questions: map[string]Question{}, sessions: map[string]*session{}}
+	a.epoch = randomID()
+	a.stateDir = os.Getenv("STATE_DIRECTORY")
+	if a.stateDir == "" {
+		a.stateDir = cfg.Data + ".logins"
+	}
 	host, port, e := net.SplitHostPort(cfg.Listen)
 	if e != nil || host != "127.0.0.1" || port == "" || cfg.Parallel < 1 || cfg.Parallel > 2 || !filepath.IsAbs(cfg.Data) {
 		return nil, errors.New("config requires IPv4 loopback listen, parallel 1 or 2, and an absolute private data directory")
@@ -100,6 +102,9 @@ func newApp(cfg settings, api sub2) (*app, error) {
 	a.bankVersion = hex.EncodeToString(hash[:])
 	root, _ := fs.Sub(assets, "web")
 	a.static = http.FileServer(http.FS(root))
+	if err := a.loadLogins(); err != nil {
+		return nil, err
+	}
 	a.queue, e = openQueue(cfg.Data, a.bankVersion, api.Probe)
 	return a, e
 }
@@ -144,62 +149,6 @@ func (a *app) validHost(h string) bool {
 	_, port, _ := net.SplitHostPort(a.cfg.Listen)
 	return h == a.cfg.Listen || h == net.JoinHostPort("localhost", port)
 }
-func (a *app) lookup(r *http.Request) *session {
-	c, err := r.Cookie("s2fp_session")
-	if err != nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	s := a.sessions[c.Value]
-	if s != nil && time.Now().Before(s.end) {
-		return s
-	}
-	return nil
-}
-func (a *app) prune() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for k, s := range a.sessions {
-		if !time.Now().Before(s.end) {
-			s.cancel()
-			delete(a.sessions, k)
-		}
-	}
-}
-func (a *app) replace(w http.ResponseWriter, old *session, info LoginResult) (*session, bool) {
-	a.prune()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if old != nil {
-		if a.sessions[old.key] != old {
-			fail(w, 409, "STALE_SESSION", "登录状态已变化，请刷新页面")
-			return nil, false
-		}
-		delete(a.sessions, old.key)
-		old.cancel()
-	}
-	if len(a.sessions) >= 48 {
-		fail(w, 429, "SESSION_LIMIT", "本机打开的会话过多，请稍后重试")
-		return nil, false
-	}
-	lifetime := 15 * time.Minute
-	if info.Temp != "" {
-		lifetime = 5 * time.Minute
-	}
-	if info.JWT != "" {
-		lifetime = 30 * time.Minute
-		if info.ExpiresIn > 0 && info.ExpiresIn < 1800 {
-			lifetime = time.Duration(info.ExpiresIn) * time.Second
-		}
-	}
-	end := time.Now().Add(lifetime)
-	ctx, cancel := context.WithDeadline(context.Background(), end)
-	s := &session{key: randomID(), csrf: randomID(), jwt: info.JWT, refresh: info.Refresh, temp: info.Temp, owner: info.UserID, end: end, ctx: ctx, cancel: cancel}
-	a.sessions[s.key] = s
-	http.SetCookie(w, &http.Cookie{Name: "s2fp_session", Value: s.key, HttpOnly: true, SameSite: http.SameSiteStrictMode, Path: "/", Expires: end})
-	return s, true
-}
 func (a *app) allowAuth() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -211,7 +160,7 @@ func (a *app) allowAuth() bool {
 	return a.attempts <= 12
 }
 func (a *app) sessionView(s *session) map[string]any {
-	return map[string]any{"logged_in": s.jwt != "", "needs_2fa": s.temp != "", "csrf": s.csrf, "parallel": a.cfg.Parallel, "bank_version": a.bankVersion, "version": strings.TrimSpace(releaseVersion)}
+	return map[string]any{"epoch": a.epoch, "remembered": s.remember && s.owner > 0, "expires_at": s.end.UTC(), "logged_in": s.verified && s.jwt != "", "needs_2fa": s.temp != "", "csrf": s.csrf, "parallel": a.cfg.Parallel, "bank_version": a.bankVersion, "version": strings.TrimSpace(releaseVersion)}
 }
 func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -229,7 +178,7 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.queue.mu.Lock()
-		ok := !a.queue.storageFault && !a.queue.stopping
+		ok := !a.queue.stopping
 		a.queue.mu.Unlock()
 		if !ok {
 			fail(w, 503, "STORAGE", "记录存储不可用")
@@ -251,11 +200,33 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s := a.lookup(r)
+	if s != nil {
+		defer s.mu.Unlock()
+	}
 	if r.Method == "POST" {
 		mt, _, e := mime.ParseMediaType(r.Header.Get("Content-Type"))
 		if e != nil || mt != "application/json" || r.Header.Get("Origin") != "http://"+r.Host || s == nil || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-CSRF-Token")), []byte(s.csrf)) != 1 {
 			fail(w, 403, "CSRF", "页面会话已过期或来源不符，请刷新")
 			return
+		}
+	}
+	if s != nil && p != "/api/logout" && s.owner > 0 {
+		if err := a.authorize(r.Context(), s); err != nil {
+			if invalidLogin(err) {
+				if err = a.dropLogin(s); err != nil {
+					fail(w, 503, "SESSION_STORE", "无法清除已失效的登录状态")
+					return
+				}
+				if p == "/api/session" {
+					s = nil
+				} else {
+					fail(w, 401, "SESSION", "登录已失效，请重新登录")
+					return
+				}
+			} else {
+				fail(w, 503, "SESSION_RETRY", "暂时无法续期，请稍后重试")
+				return
+			}
 		}
 	}
 	if p == "/api/session" {
@@ -264,7 +235,7 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if s == nil {
 			var ok bool
-			s, ok = a.replace(w, nil, LoginResult{})
+			s, ok = a.replace(w, nil, LoginResult{}, false)
 			if !ok {
 				return
 			}
@@ -292,7 +263,7 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		list, e := a.api.List(r.Context(), s.jwt)
 		if e != nil {
-			fault(w, e)
+			a.sessionFailure(w, s, e)
 			return
 		}
 		respond(w, 200, map[string]any{"accounts": list})
@@ -339,7 +310,7 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 		if !decode(w, r, &empty) {
 			return
 		}
-		newSession, ok := a.replace(w, s, LoginResult{})
+		newSession, ok := a.replace(w, s, LoginResult{}, false)
 		if !ok {
 			return
 		}
@@ -355,6 +326,7 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 		fail(w, 429, "RATE_LIMIT", "验证次数过多，请稍后再试")
 		return
 	}
+	remember := s.remember
 	var info LoginResult
 	var err error
 	switch p {
@@ -404,6 +376,7 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 		var b struct {
 			Email    string `json:"email"`
 			Password string `json:"password"`
+			Remember bool   `json:"remember"`
 		}
 		if !decode(w, r, &b) {
 			return
@@ -413,6 +386,7 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 			fail(w, 400, "LOGIN_INPUT", "请输入有效的邮箱和密码")
 			return
 		}
+		remember = b.Remember
 		info, err = a.api.Login(r.Context(), b.Email, b.Password)
 	}
 	if err != nil {
@@ -430,7 +404,7 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 	if info.Temp != "" {
 		info = LoginResult{Temp: info.Temp}
 	}
-	st, ok := a.replace(w, s, info)
+	st, ok := a.replace(w, s, info, remember)
 	if !ok {
 		if info.Refresh != "" {
 			_ = a.api.Logout(r.Context(), info.Refresh)
@@ -442,6 +416,10 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 func (a *app) submit(w http.ResponseWriter, r *http.Request, s *session) {
 	var req RunRequest
 	if !decode(w, r, &req) {
+		return
+	}
+	if req.Epoch != a.epoch {
+		fail(w, 409, "OLD_RUN", "检测服务已重新启动，旧提交不会重发。请重新开始一轮检测")
 		return
 	}
 	if !uuidFormat.MatchString(req.ID) || len(req.Accounts) < 1 || len(req.Accounts) > 24 || len(req.Questions) < 1 || len(req.Questions) > 3 || req.Parallel < 1 || req.Parallel > a.cfg.Parallel {
@@ -477,7 +455,7 @@ func (a *app) submit(w http.ResponseWriter, r *http.Request, s *session) {
 	}
 	accounts, err := a.api.List(r.Context(), s.jwt)
 	if err != nil {
-		fault(w, err)
+		a.sessionFailure(w, s, err)
 		return
 	}
 	byID := make(map[int64]AccountView, len(accounts))
@@ -557,26 +535,34 @@ func run() error {
 		return err
 	}
 	defer a.queue.close()
-	srv := &http.Server{Addr: cfg.Listen, Handler: a, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 40 * time.Second, IdleTimeout: 45 * time.Second, MaxHeaderBytes: 16 << 10}
+	listener, activated, err := detectorListener(cfg.Listen)
+	if err != nil {
+		return err
+	}
+	activity := newIdleTracker()
+	srv := &http.Server{Handler: activity.track(a), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 65 * time.Second, IdleTimeout: 45 * time.Second, MaxHeaderBytes: 16 << 10}
 	stop, done := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer done()
 	go func() {
-		t := time.NewTicker(time.Minute)
-		defer t.Stop()
+		tick := time.NewTicker(5 * time.Second)
+		defer tick.Stop()
 		for {
 			select {
-			case <-t.C:
-				a.prune()
 			case <-stop.Done():
-				ctx, c := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = srv.Shutdown(ctx)
-				c()
-				return
+			case <-tick.C:
+				a.prune()
+				if !activated || !activity.idle(time.Now(), 2*time.Minute, a.queue.busy()) {
+					continue
+				}
 			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+			return
 		}
 	}()
 	log.Printf("private detector listening on %s", cfg.Listen)
-	err = srv.ListenAndServe()
+	err = srv.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

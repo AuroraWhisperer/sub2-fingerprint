@@ -217,6 +217,16 @@ h4 {
 .narrow .field {
   margin-bottom: 16px;
 }
+.remember {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  font-size: 14px;
+  cursor: pointer;
+}
+#sessionInfo {
+  margin: -12px 0 18px;
+}
 .narrow .primary {
   margin-top: 2px;
 }
@@ -374,7 +384,7 @@ pre {
 .choices .empty {
   padding: 10px 12px;
 }
-.history {
+.retention {
   margin-bottom: 16px;
 }
 .state {

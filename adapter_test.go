@@ -323,3 +323,86 @@ func TestAdapterIncompleteStreamsAndTokenMismatch(t *testing.T) {
 	_, err := requestHeaders(accountData{}, credentialData{Token: token, AccountID: "selected"}, time.Now())
 	assertGate(t, err, "IDENTITY")
 }
+
+func TestAdapterRefreshAndVerifyOwner(t *testing.T) {
+	var refreshCalls, meCalls int
+	panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			refreshCalls++
+			var b map[string]string
+			if r.Method != "POST" || r.Header.Get("Authorization") != "" || json.NewDecoder(r.Body).Decode(&b) != nil || len(b) != 1 || b["refresh_token"] != "old-refresh" {
+				t.Error("wrong refresh request")
+			}
+			mockOK(w, map[string]any{"access_token": "new-access", "refresh_token": "new-refresh", "token_type": "Bearer", "expires_in": 1200})
+		case "/api/v1/auth/me":
+			meCalls++
+			if r.Method != "GET" || r.Header.Get("Authorization") != "Bearer new-access" {
+				t.Error("wrong profile request")
+			}
+			if meCalls == 1 {
+				w.WriteHeader(503)
+				return
+			}
+			mockOK(w, map[string]any{"id": 9, "role": "admin", "status": "active"})
+		default:
+			t.Error("unexpected endpoint")
+			w.WriteHeader(404)
+		}
+	}))
+	defer panel.Close()
+	a, _ := NewAdapter(panel.URL)
+	ctx := context.Background()
+	pair, err := a.Refresh(ctx, "old-refresh")
+	if err != nil || pair.Admin || pair.UserID != 0 || pair.JWT != "new-access" || pair.Refresh != "new-refresh" || pair.ExpiresIn != 1200 {
+		t.Fatal("wrong unverified rotation result", err)
+	}
+	assertGate(t, a.VerifyAdmin(ctx, pair.JWT, 9), "SESSION_TEMPORARY")
+	if err = a.VerifyAdmin(ctx, pair.JWT, 9); err != nil {
+		t.Fatal(err)
+	}
+	assertGate(t, a.VerifyAdmin(ctx, pair.JWT, 10), "SESSION_INVALID")
+	if refreshCalls != 1 || meCalls != 3 {
+		t.Fatal("verification retried a rotation")
+	}
+}
+
+func TestAdapterSessionFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, op       string
+		status         int
+		response, want string
+	}{
+		{"expired access", "me", 401, `{"code":"TOKEN_EXPIRED"}`, "ACCESS_EXPIRED"},
+		{"revoked", "me", 401, `{"code":"TOKEN_REVOKED"}`, "SESSION_INVALID"},
+		{"expired refresh", "refresh", 401, `{"code":401,"reason":"REFRESH_TOKEN_EXPIRED"}`, "SESSION_INVALID"},
+		{"used refresh", "refresh", 401, `{"code":401,"reason":"REFRESH_TOKEN_INVALID"}`, "SESSION_INVALID"},
+		{"binding changed", "me", 401, `{"code":"SESSION_BINDING_MISMATCH"}`, "SESSION_INVALID"},
+		{"disabled at refresh", "refresh", 403, `{"code":403,"reason":"USER_NOT_ACTIVE"}`, "SESSION_INVALID"},
+		{"role downgrade", "me", 200, `{"code":0,"data":{"id":9,"role":"user","status":"active"}}`, "SESSION_INVALID"},
+		{"disabled profile", "me", 200, `{"code":0,"data":{"id":9,"role":"admin","status":"disabled"}}`, "SESSION_INVALID"},
+		{"backend downgrade", "refresh", 403, `{"code":403,"message":"Backend mode is active. Only admin login is allowed."}`, "SESSION_INVALID"},
+		{"missing identity fields", "me", 200, `{"code":0,"data":{"user":{"id":9,"role":"admin"}}}`, "SESSION_TEMPORARY"},
+		{"repeated refresh token", "refresh", 200, `{"code":0,"data":{"access_token":"new","refresh_token":"old","expires_in":300,"token_type":"Bearer"}}`, "SESSION_TEMPORARY"},
+		{"unknown expiry", "refresh", 200, `{"code":0,"data":{"access_token":"new","refresh_token":"new-refresh","token_type":"Bearer"}}`, "SESSION_TEMPORARY"},
+		{"rate limit", "refresh", 429, `{"code":429,"message":"example-sensitive"}`, "SESSION_TEMPORARY"},
+		{"database offline", "me", 500, `{"code":"INTERNAL_ERROR","message":"example-sensitive"}`, "SESSION_TEMPORARY"},
+		{"disconnected reverse proxy", "refresh", 401, `<html>example-sensitive</html>`, "SESSION_TEMPORARY"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); io.WriteString(w, tc.response) }))
+			defer panel.Close()
+			a, _ := NewAdapter(panel.URL)
+			var err error
+			if tc.op == "refresh" {
+				_, err = a.Refresh(context.Background(), "old")
+			} else {
+				err = a.VerifyAdmin(context.Background(), "jwt", 9)
+			}
+			assertGate(t, err, tc.want)
+			if strings.Contains(err.Error(), "example-sensitive") {
+				t.Fatal("remote error text leaked")
+			}
+		})
+	}
+}

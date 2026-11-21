@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tarfile
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -46,148 +47,224 @@ class Lifecycle(unittest.TestCase):
         root.parent.mkdir()
         unit = self.tmp / 'system' / (d.NAME + '.service')
         unit.parent.mkdir()
-        self.vendor = bundle(self.tmp / 'v1', 'v0.1.0')
-        self.successor = bundle(self.tmp / 'v2', 'v0.1.1', extra_license=True)
-        self.stack.enter_context(patch.multiple(d, ROOT=root, UNIT=unit, RUNS=root/'data/runs',
+        self.vendor = bundle(self.tmp / 'v1', 'v0.2.0')
+        self.successor = bundle(self.tmp / 'v2', 'v0.2.1', extra_license=True)
+        sock = unit.with_suffix('.socket')
+        state = self.tmp/'var/lib'/d.NAME
+        state.parent.mkdir(parents=True)
+        self.stack.enter_context(patch.multiple(d, ROOT=root, UNIT=unit, SOCKET=sock, STATE=state, RUNS=root/'data/runs',
                                                 MARKER=root/'install-manifest.json', BUNDLE=self.vendor))
         self.user = None
         self.group = None
         self.commands = []
-        self.properties = {'ActiveState': 'inactive', 'FragmentPath': str(unit), 'DropInPaths': ''}
+        self.active = set()
+        self.enabled = set()
         self.stack.enter_context(patch.object(d, 'run', side_effect=self.host))
         self.stack.enter_context(patch.object(d, 'identity', side_effect=lambda: (self.user, self.group)))
-        self.stack.enter_context(patch.object(d, 'system_property', side_effect=lambda x: self.properties[x]))
+        self.stack.enter_context(patch.object(d, 'system_property', side_effect=self.prop))
         self.stack.enter_context(patch.object(d, 'mounts_inside', return_value=False))
         self.stack.enter_context(patch.object(d, 'root_owned', return_value=True))
+        self.stack.enter_context(patch.object(d, 'state_permissions', return_value=True))
+        if os.name == 'nt':
+            # The actual installer runs on Linux. Windows scanners can briefly hold a fixture's rename handle.
+            def sharing_retry(operation):
+                def retry(*args, **kwargs):
+                    for attempt in range(8):
+                        try:
+                            return operation(*args, **kwargs)
+                        except PermissionError as exc:
+                            if exc.winerror not in (5, 32, 33) or attempt == 7:
+                                raise
+                            time.sleep(0.04 * (attempt + 1))
+                return retry
+            for name in ('rename', 'replace'):
+                self.stack.enter_context(patch.object(os, name, sharing_retry(getattr(os, name))))
+        self.stack.enter_context(patch.object(d, 'check_port'))
         self.stack.enter_context(patch.object(d.os, 'chown', create=True))
         self.stack.enter_context(patch.object(d.shutil, 'which', return_value='/usr/sbin/nologin'))
-        fake_pwd = SimpleNamespace(getpwall=lambda: [self.user] if self.user else [])
-        self.stack.enter_context(patch.dict('sys.modules', {'pwd': fake_pwd}))
+        self.stack.enter_context(patch.dict('sys.modules', {'pwd': SimpleNamespace(getpwall=lambda: [self.user] if self.user else [])}))
         self.reject_verify = False
+
+    def prop(self, prop, unit=None):
+        unit = unit or d.UNIT
+        return {'ActiveState': 'active' if unit in self.active else 'inactive',
+                'UnitFileState':'enabled' if unit in self.enabled else 'disabled',
+                'LoadState':'loaded' if unit.is_file() else 'not-found',
+                'FragmentPath':str(unit) if unit.is_file() else '', 'MainPID':'17', 'DropInPaths':''}[prop]
 
     def host(self, *args, **kwargs):
         self.commands.append(args)
         if args[0] == 'groupadd':
             self.group = SimpleNamespace(gr_gid=4101, gr_mem=[])
-        if args[0] == 'useradd':
+        elif args[0] == 'useradd':
             self.user = SimpleNamespace(pw_uid=4102, pw_gid=4101, pw_name=d.NAME, pw_dir='/nonexistent', pw_shell='/usr/sbin/nologin')
-        if args[0] == 'userdel':
+        elif args[0] == 'userdel':
             self.user = None
-        if args[0] == 'groupdel':
+        elif args[0] == 'groupdel':
             self.group = None
-        if args[0] == 'systemd-analyze' and self.reject_verify:
+        elif args[0] == 'systemd-analyze' and self.reject_verify:
             raise ValueError('simulated unit verification failure')
-        if args[:2] == ('systemctl', 'start'):
-            self.properties['ActiveState'] = 'active'
-        if args[:2] in (('systemctl', 'disable'), ('systemctl', 'stop')):
-            self.properties['ActiveState'] = 'inactive'
+        elif args[0] == 'systemctl' and args[1] != 'daemon-reload':
+            unit = d.UNIT if args[-1] == d.UNIT.name else d.SOCKET
+            if args[1] == 'enable':
+                self.enabled.add(unit)
+            if args[1] == 'disable':
+                self.enabled.discard(unit)
+            if args[1] == 'start' or (args[1]=='enable' and '--now' in args):
+                self.active.add(unit)
+            if args[1] == 'stop' or (args[1]=='disable' and '--now' in args):
+                self.active.discard(unit)
         return SimpleNamespace(returncode=0, stdout='')
 
     def install(self):
-        d.perform_install('http://127.0.0.1:8080', d.bundle_files(self.vendor))
-        self.assertEqual(self.properties['ActiveState'], 'inactive')
-        self.assertEqual(json.loads((d.ROOT/'config/config.json').read_text())['parallel'], 1)
-        result = d.RUNS / 'b80311ce-0331-4fa2-9d82-9a94eb72e526.json'
-        result.write_bytes(b'old answers')
-        return result
+        d.perform_install('http://127.0.0.1:8080',d.bundle_files(self.vendor))
+        self.assertEqual(self.active,{d.SOCKET})
+        self.assertEqual(self.enabled,{d.SOCKET})
+        self.assertFalse(d.RUNS.exists())
+        self.assertEqual(json.loads((d.ROOT/'config/config.json').read_text())['parallel'],1)
+        session = d.STATE/('a'*64+'.session')
+        session.write_bytes(b'fixture renewable session')
+        return session
+
+    def legacy(self, active=False):
+        self.host('groupadd'); self.host('useradd')
+        d.ROOT.mkdir()
+        owned=set(d.ENTRY.values()) - {'docs/'+d.SOCKET.name}
+        for name in owned:
+            dest=d.ROOT/name
+            dest.parent.mkdir(parents=True,exist_ok=True)
+            dest.write_text('v0.1.0' if name=='VERSION' else 'old '+name)
+        (d.ROOT/'config').mkdir()
+        (d.ROOT/'config/config.json').write_text('{"parallel":2,"data_dir":"/previous"}')
+        d.UNIT.write_bytes((d.ROOT/'docs'/d.UNIT.name).read_bytes())
+        d.jwrite(d.MARKER, dict(format=1,root=str(d.ROOT),dev=d.ROOT.stat().st_dev,ino=d.ROOT.stat().st_ino,
+            uid=self.user.pw_uid,gid=self.group.gr_gid,service=str(d.UNIT),unit_sha256=d.digest(d.UNIT),
+            files=sorted(owned|{'config/config.json',d.MARKER.name})))
+        self.enabled.add(d.UNIT)
+        if active:
+            self.active.add(d.UNIT)
+        d.RUNS.mkdir(parents=True)
+        path=d.RUNS/'b80311ce-0331-4fa2-9d82-9a94eb72e526.json'
+        path.write_bytes(b'v0.1 answers')
+        return path
 
     def apply(self):
         u.apply(self.successor, d.bundle_files(self.successor), d.verify_manifest(), d.ROOT/'.rollback')
 
-    def test_failed_install_undoes_only_new_resources(self):
-        neighbor = d.ROOT.parent / 'sub2api'
+    def test_failed_fresh_install_removes_only_new_resources(self):
+        neighbor = d.ROOT.parent/'sub2api'
         neighbor.write_text('live site')
         self.reject_verify = True
         with self.assertRaisesRegex(ValueError, 'simulated'):
             d.perform_install('http://127.0.0.1:8080', d.bundle_files(self.vendor))
-        self.assertEqual((self.user, self.group), (None, None))
-        self.assertFalse(d.ROOT.exists())
-        self.assertFalse(d.UNIT.exists())
-        self.assertEqual(neighbor.read_text(), 'live site')
+        self.assertEqual((self.user,self.group),(None,None))
+        self.assertFalse(any(p.exists() for p in (d.ROOT,d.STATE,d.UNIT,d.SOCKET)))
+        self.assertEqual(neighbor.read_text(),'live site')
 
-    def test_backup_before_uninstall_and_preserve_unrecognized_files(self):
-        result = self.install()
-        opts = SimpleNamespace(check=False, purge_results=False, backup_to=None)
-        with self.assertRaisesRegex(ValueError, '--backup-to'):
-            d.uninstall(opts)
-        other = d.RUNS / 'operator-note.txt'
-        other.write_text('retain')
+    def test_uninstall_removes_session_without_backup_and_preserves_unknown_files(self):
+        session = self.install()
+        extra = d.STATE/'personal-file'
+        extra.write_bytes(b'keep')
         with self.assertRaises(ValueError):
-            d.uninstall(SimpleNamespace(check=False, purge_results=True, backup_to=None))
-        self.assertTrue(other.exists())
-        other.unlink()
-        backup = self.tmp / 'answers.tar.gz'
-        opts.backup_to = str(backup)
-        d.uninstall(opts)
-        with tarfile.open(backup) as archive:
-            self.assertEqual(archive.extractfile('runs/' + result.name).read(), b'old answers')
-        self.assertFalse(d.ROOT.exists())
-        self.assertFalse(d.UNIT.exists())
-        self.assertEqual((self.user, self.group), (None,None))
+            d.uninstall(SimpleNamespace(check=False))
+        self.assertEqual(extra.read_bytes(),b'keep')
+        self.assertTrue(session.exists())
+        extra.unlink()
+        d.uninstall(SimpleNamespace(check=False))
+        self.assertFalse(any(p.exists() for p in (d.ROOT,d.STATE,d.UNIT,d.SOCKET)))
+        self.assertFalse(list(self.tmp.rglob('*.gz')))
 
-    def test_inactive_update_keeps_config_state_and_results(self):
-        result = self.install()
-        config = d.ROOT/'config/config.json'
+    def test_inactive_update_keeps_config_session_and_listener_state(self):
+        session=self.install()
+        self.active.clear(); self.enabled.clear()
+        config=d.ROOT/'config/config.json'
         config.write_text('{"parallel": 2, "local_override": true}')
-        with patch.object(u,'health',side_effect=AssertionError('started inactive service')):
+        with patch.object(u,'health',side_effect=AssertionError('started inactive socket')):
             self.apply()
-        self.assertEqual(u.file_version(d.ROOT/'VERSION'), (0,1,1))
+        self.assertEqual(u.file_version(d.ROOT/'VERSION'),(0,2,1))
         self.assertTrue(json.loads(config.read_text())['local_override'])
-        self.assertEqual(result.read_bytes(), b'old answers')
-        self.assertEqual(self.properties['ActiveState'], 'inactive')
-        self.assertFalse((d.ROOT/'.rollback').exists())
+        self.assertEqual(session.read_bytes(),b'fixture renewable session')
+        self.assertFalse(self.active or self.enabled or (d.ROOT/'.rollback').exists())
         d.verify_manifest()
 
-    def test_failed_health_restores_previous_active_release(self):
-        result = self.install()
-        config = (d.ROOT/'config/config.json').read_bytes()
-        manifest = d.MARKER.read_bytes()
-        unit = d.UNIT.read_bytes()
-        binary = (d.ROOT/'bin'/d.NAME).read_bytes()
-        self.properties['ActiveState']='active'
-        with patch.object(u,'health',side_effect=[ValueError('simulated wrong process'), None]) as check:
-            with self.assertRaisesRegex(ValueError, 'simulated wrong'):
+    def test_migration_commits_only_after_healthy_wakeup(self):
+        run=self.legacy(active=True)
+        cfg=(d.ROOT/'config/config.json').read_bytes()
+        def live_test():
+            self.assertTrue(run.exists())
+            self.assertFalse(list((d.ROOT/'.rollback').rglob(run.name)))
+            self.assertIn(d.SOCKET,self.active)
+        with patch.object(u,'health',side_effect=live_test), patch.object(u,'owned_process',return_value=True):
+            self.apply()
+        self.assertEqual(self.active,{d.SOCKET})
+        self.assertEqual(self.enabled,{d.SOCKET})
+        self.assertFalse(d.RUNS.parent.exists())
+        self.assertEqual((d.ROOT/'config/config.json').read_bytes(),cfg)
+        self.assertTrue(d.STATE.is_dir())
+        self.assertEqual(d.verify_manifest()['format'],2)
+        self.assertLess(self.commands.index(('systemctl','stop',d.UNIT.name)),self.commands.index(('systemctl','start',d.SOCKET.name)))
+
+    def test_failed_migration_restores_old_service_and_answers(self):
+        run=self.legacy(active=True)
+        manifest=d.MARKER.read_bytes()
+        unit=d.UNIT.read_bytes()
+        with patch.object(u,'health',side_effect=[ValueError('bad new health'),None]) as live, patch.object(u,'owned_process',return_value=True):
+            with self.assertRaisesRegex(ValueError,'bad new health'):
                 self.apply()
-        self.assertEqual(check.call_count, 2)
-        self.assertEqual(self.properties['ActiveState'], 'active')
-        self.assertEqual((d.ROOT/'bin'/d.NAME).read_bytes(), binary)
-        self.assertEqual(d.UNIT.read_bytes(), unit)
+        self.assertEqual(live.call_count,2)
+        self.assertEqual(self.active,{d.UNIT})
+        self.assertEqual(self.enabled,{d.UNIT})
+        self.assertEqual(run.read_bytes(),b'v0.1 answers')
         self.assertEqual(d.MARKER.read_bytes(),manifest)
-        self.assertEqual((d.ROOT/'config/config.json').read_bytes(), config)
-        self.assertEqual(result.read_bytes(), b'old answers')
-        self.assertFalse((d.ROOT/'LICENSES/extra.txt').exists())
-        self.assertFalse((d.ROOT/'.rollback').exists())
-        d.verify_manifest()
+        self.assertEqual(d.UNIT.read_bytes(),unit)
+        self.assertFalse(d.STATE.exists() or d.SOCKET.exists() or (d.ROOT/'.rollback').exists())
+        self.assertEqual(d.verify_manifest()['format'],1)
 
-    def test_recover_interrupted_update(self):
-        result = self.install()
-        folder = d.ROOT/'.rollback'
-        before = d.MARKER.read_bytes()
-        u.snapshot(folder, d.verify_manifest(), d.bundle_files(self.successor), False)
-        (d.ROOT/'VERSION').write_text('v0.1.1')
-        (d.ROOT/'LICENSES'/'extra.txt').write_text('interrupted')
-        u.recover(folder)
-        self.assertEqual(u.file_version(d.ROOT/'VERSION'), (0,1,0))
+    def test_migration_rejects_foreign_directory_unit_or_port_before_stopping(self):
+        run=self.legacy()
+        d.STATE.mkdir(); other=d.STATE/'original'; other.write_text('keep')
+        with self.assertRaises(ValueError): self.apply()
+        self.assertEqual(other.read_text(),'keep')
+        other.unlink(); d.STATE.rmdir()
+        d.SOCKET.write_text('other unit')
+        with self.assertRaises(ValueError): self.apply()
+        self.assertEqual(d.SOCKET.read_text(),'other unit')
+        d.SOCKET.unlink()
+        with patch.object(d,'check_port',side_effect=OSError('occupied')),self.assertRaises(OSError): self.apply()
+        self.assertTrue(run.exists())
+        self.assertFalse(any(c[:2]==('systemctl','stop') for c in self.commands))
+
+    def test_failed_socket_update_preserves_remembered_session(self):
+        session=self.install()
+        stamp=d.MARKER.read_bytes()
+        with patch.object(u,'health',side_effect=[ValueError('bad new health'),None]), self.assertRaises(ValueError):
+            self.apply()
+        self.assertEqual(d.MARKER.read_bytes(),stamp)
+        self.assertEqual(session.read_bytes(),b'fixture renewable session')
+        self.assertEqual(self.active,{d.SOCKET})
+        self.assertEqual(self.enabled,{d.SOCKET})
         self.assertFalse((d.ROOT/'LICENSES/extra.txt').exists())
-        self.assertEqual(d.MARKER.read_bytes(), before)
-        self.assertEqual(result.read_bytes(), b'old answers')
-        self.assertFalse(folder.exists())
+
+    def test_committed_migration_resumes_interrupted_purge(self):
+        run=self.legacy()
+        with patch.object(u,'health'), patch.object(d,'purge_legacy_runs',side_effect=OSError('interrupted')):
+            with self.assertRaisesRegex(OSError,'interrupted'): self.apply()
+        self.assertTrue((d.ROOT/'.rollback/verified-migration').exists() and run.exists())
+        u.recover(d.ROOT/'.rollback')
+        self.assertFalse((d.ROOT/'.rollback').exists() or run.exists())
+        self.assertEqual(d.verify_manifest()['format'],2)
 
     def test_health_requires_expected_version_and_process(self):
-        self.install()
-        self.properties.update(ActiveState='active', MainPID='10')
-        class Response(io.BytesIO):
-            status = 200
-        opener = SimpleNamespace(open=lambda *a, **kw: Response(json.dumps(self.served).encode()))
-        with patch.object(u.request, 'build_opener', return_value=opener), patch.object(u.time,'sleep'), patch.object(u.os.path,'samefile', return_value=True) as same:
-            self.served = {'status': 'ok', 'version':'v9.9.9'}
-            with self.assertRaises(ValueError):
-                u.health()
-            self.served = {'status':'ok','version':'v0.1.0','additional':True}
-            same.return_value = False
-            with self.assertRaises(ValueError):
-                u.health()
-            same.return_value = True
+        self.install(); self.active.add(d.UNIT)
+        class Response(io.BytesIO): status=200
+        opener=SimpleNamespace(open=lambda *a,**kw: Response(json.dumps(self.served).encode()))
+        with patch.object(u.request,'build_opener',return_value=opener), patch.object(u.time,'sleep'), patch.object(u,'owned_process',return_value=True) as same:
+            self.served={'status':'ok','version':'v9.9.9'}
+            with self.assertRaises(ValueError): u.health()
+            self.served={'status':'ok','version':'v0.2.0','additional':True}
+            same.return_value=False
+            with self.assertRaises(ValueError): u.health()
+            same.return_value=True
             u.health()
 
 

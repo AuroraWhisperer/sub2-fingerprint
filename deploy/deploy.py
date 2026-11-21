@@ -13,18 +13,20 @@ import socket
 import struct
 import subprocess
 import sys
-import tarfile
 from urllib.parse import urlsplit
 
 NAME = 'sub2-fingerprint'
 ROOT = Path('/opt') / NAME
 UNIT = Path('/etc/systemd/system') / (NAME + '.service')
-RUNS = ROOT / 'data/runs'
+SOCKET = UNIT.with_suffix('.socket')
+STATE = Path('/var/lib') / NAME
+RUNS = ROOT / 'data/runs'  # Legacy v0.1.0, cleaned only after a successful migration.
 MARKER = ROOT / 'install-manifest.json'
 BUNDLE = Path(__file__).resolve().parent
 ENTRY = {NAME: 'bin/' + NAME, 'VERSION': 'VERSION', 'DEPLOYMENT.md': 'docs/DEPLOYMENT.md',
          'uninstall.sh': 'uninstall.sh', 'deploy.py': 'deploy.py', 'update.sh': 'update.sh',
-         'update.py': 'update.py', UNIT.name: 'docs/' + UNIT.name}
+         'update.py': 'update.py', 'units/' + UNIT.name: 'docs/' + UNIT.name,
+         'units/' + SOCKET.name: 'docs/' + SOCKET.name}
 PORT = 17861
 RUN_FILE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(json|partial)')
 
@@ -115,29 +117,86 @@ def check_arch(binary):
     require(len(hdr) == 20 and hdr[:6] == b'\x7fELF\x02\x01' and
             struct.unpack('<H', hdr[18:20])[0] == {'aarch64': 183, 'x86_64': 62}.get(platform.machine()), '安装包与 Linux CPU 架构不匹配')
 
-def system_property(prop):
-    r = run('systemctl', 'show', UNIT.name, '-p', prop, '--value', check=False)
+def system_property(prop, unit=None):
+    r = run('systemctl', 'show', (unit or UNIT).name, '-p', prop, '--value', check=False)
     require(r.returncode in (0, 4), '无法读取 systemd 状态')
     return r.stdout.strip()
+
+def vacant(path):
+    require(path.parent.is_dir() and path.parent.resolve() == path.parent and root_owned(path.parent) and
+            not os.path.lexists(path), '保留现有文件或目录：' + str(path))
+
+def unused_unit(path):
+    vacant(path)
+    require(system_property('LoadState', path) == 'not-found' and not system_property('DropInPaths', path),
+            '已存在同名 systemd 单元或附加配置：' + path.name)
+
+def check_port():
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(('127.0.0.1', PORT))
+        probe.listen(1)
+
+def create_state(uid, gid):
+    vacant(STATE)
+    STATE.mkdir(0o700)
+    try:
+        os.chown(STATE, uid, gid)
+        st = STATE.stat()
+        return {'path': str(STATE), 'dev': st.st_dev, 'ino': st.st_ino}
+    except BaseException:
+        STATE.rmdir()
+        raise
+
+def state_identity(mark, uid, gid):
+    require(mark['path'] == str(STATE) and STATE.is_dir() and STATE.resolve() == STATE and not mounts_inside(STATE),
+            '登录状态目录身份不符')
+    st = STATE.stat()
+    require((st.st_dev, st.st_ino) == (mark['dev'], mark['ino']) and state_permissions(st, uid, gid),
+            '登录状态目录的归属、权限或身份不符')
+
+def state_permissions(st, uid, gid):
+    return (st.st_uid, st.st_gid, st.st_mode & 0o777) == (uid, gid, 0o700)
+
+def check_state_contents():
+    for p in STATE.iterdir():
+        require(regular(p) and p.stat().st_nlink == 1 and re.fullmatch(r'[0-9a-f]{64}\.(?:session|pending)', p.name),
+                '登录目录包含未识别文件，请先检查')
+
+def remove_state(mark, uid, gid):
+    state_identity(mark, uid, gid)
+    check_state_contents()
+    shutil.rmtree(STATE)
 
 def preflight():
     require(platform.system() == 'Linux' and Path('/run/systemd/system').is_dir(), '需要正在运行的 Linux systemd')
     require({'cpu', 'memory', 'pids'} <= set(Path('/sys/fs/cgroup/cgroup.controllers').read_text().split()), '需要 cgroup v2 的 cpu、memory 和 pids 控制器')
-    for path in (ROOT, UNIT):
-        require(path.parent.is_dir() and path.parent.resolve() == path.parent and not os.path.lexists(path), '保留现有文件或目录：' + str(path))
-    require(system_property('LoadState') == 'not-found' and not system_property('DropInPaths'), '系统中存在同名服务或附加配置')
+    vacant(ROOT)
+    vacant(STATE)
+    unused_unit(UNIT)
+    unused_unit(SOCKET)
     require(identity() == (None, None), '已有同名用户或组')
-    with socket.socket() as probe:
-        probe.bind(('127.0.0.1', PORT))
+    check_port()
     total, avail = memory_mib()
-    print(f'内存 {total} MiB，可用 {avail} MiB。安装后默认停止。')
+    print(f'内存 {total} MiB，可用 {avail} MiB。服务由回环 socket 按需唤起。')
     if avail < 128:
         print('当前余量小于试运行参考值 128 MiB。请先观察正常业务高峰的可用内存。')
+
+def sync_dir(path):
+    if os.name == 'posix':
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 def write_new(path, data, mode):
     with path.open('x', encoding='utf-8', newline='\n') as f:
         f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
     os.chmod(path, mode)
+    sync_dir(path.parent)
 
 def jwrite(path, obj, mode=0o644):
     write_new(path, json.dumps(obj, ensure_ascii=False, indent=2) + '\n', mode)
@@ -174,23 +233,25 @@ def perform_install(base, files):
         cf = ROOT / 'config/config.json'
         jwrite(cf, {'sub2_url': base, 'parallel': 1, 'listen': f'127.0.0.1:{PORT}', 'data_dir': str(RUNS)}, 0o640)
         os.chown(cf, 0, group.gr_gid)
-        (ROOT / 'data').mkdir(0o750)
-        os.chown(ROOT / 'data', 0, group.gr_gid)
-        RUNS.mkdir(0o700)
-        os.chown(RUNS, user.pw_uid, group.gr_gid)
-        source_unit = ROOT / files[UNIT.name]
-        unit_hash = digest(source_unit)
-        jwrite(MARKER, {'format': 1, 'root': str(ROOT), 'dev': ROOT.stat().st_dev, 'ino': ROOT.stat().st_ino,
-                        'uid': user.pw_uid, 'gid': group.gr_gid, 'service': str(UNIT), 'unit_sha256': unit_hash,
+        state = create_state(user.pw_uid, group.gr_gid)
+        undo.callback(remove_state, state, user.pw_uid, group.gr_gid)
+        service = ROOT / files['units/' + UNIT.name]
+        listener = ROOT / files['units/' + SOCKET.name]
+        jwrite(MARKER, {'format': 2, 'root': str(ROOT), 'dev': ROOT.stat().st_dev, 'ino': ROOT.stat().st_ino,
+                        'uid': user.pw_uid, 'gid': group.gr_gid, 'service': str(UNIT), 'state': state,
+                        'unit_sha256': digest(service), 'socket_sha256': digest(listener),
                         'files': sorted(set(files.values()) | {'config/config.json', MARKER.name})})
-        run('systemd-analyze', '--man=no', 'verify', str(source_unit))
-        with source_unit.open('rb') as inp, UNIT.open('xb') as out:
-            undo.callback(UNIT.unlink)
-            shutil.copyfileobj(inp, out)
-        os.chmod(UNIT, 0o644)
+        run('systemd-analyze', '--man=no', 'verify', str(service), str(listener))
+        for source, target in ((service, UNIT), (listener, SOCKET)):
+            with source.open('rb') as inp, target.open('xb') as out:
+                undo.callback(target.unlink)
+                shutil.copyfileobj(inp, out)
+            os.chmod(target, 0o644)
         run('systemctl', 'daemon-reload')
+        undo.callback(run, 'systemctl', 'disable', '--now', SOCKET.name, check=False)
+        run('systemctl', 'enable', '--now', SOCKET.name)
         undo.pop_all()
-    print('安装完成，服务保持停止。试运行：sudo systemctl start sub2-fingerprint.service')
+    print('安装完成，回环 socket 已监听。首次访问会启动检测器。')
 
 @contextlib.contextmanager
 def maintenance_lock():
@@ -207,13 +268,16 @@ def verify_manifest():
     require(regular(MARKER) and ROOT.resolve() == ROOT and not mounts_inside(ROOT), '未找到本工具安装清单，或目录含挂载点')
     require(root_owned(ROOT) and root_owned(MARKER), '安装目录或清单归属与权限不符')
     meta = json.loads(MARKER.read_text('utf-8'))
-    require(meta['format'] == 1 and meta['root'] == str(ROOT) and meta['service'] == str(UNIT) and
+    require(meta['format'] in (1, 2) and meta['root'] == str(ROOT) and meta['service'] == str(UNIT) and
             (meta['dev'], meta['ino']) == (ROOT.stat().st_dev, ROOT.stat().st_ino), '清单与现存目录不匹配')
-    if os.path.lexists(UNIT):
-        require(regular(UNIT) and root_owned(UNIT) and digest(UNIT) == meta['unit_sha256'] and
-                system_property('FragmentPath') == str(UNIT) and not system_property('DropInPaths'), '服务文件或附加配置已变更，请先审阅')
-    else:
-        require(system_property('LoadState') == 'not-found', '另一个同名服务仍存在')
+    units = [(UNIT, meta['unit_sha256'])]
+    if meta['format'] == 2:
+        units.append((SOCKET, meta['socket_sha256']))
+        state_identity(meta['state'], meta['uid'], meta['gid'])
+    for unit, checksum in units:
+        require(regular(unit) and root_owned(unit) and digest(unit) == checksum and
+                system_property('FragmentPath', unit) == str(unit) and not system_property('DropInPaths', unit),
+                '单元文件或附加配置已变更：' + unit.name)
     user, group = identity()
     require(user is None or (user.pw_uid == meta['uid'] and user.pw_gid == meta['gid'] and user.pw_dir == '/nonexistent' and user.pw_shell.endswith('/nologin')), '系统用户与清单不符')
     require(group is None or (group.gr_gid == meta['gid'] and not group.gr_mem), '系统组仍有其他用途')
@@ -221,50 +285,48 @@ def verify_manifest():
         import pwd
         require(all(u.pw_name == NAME for u in pwd.getpwall() if u.pw_gid == group.gr_gid), '系统组仍被其他用户使用')
     expected = set(meta['files'])
-    allowed_dirs = {str(p) for f in expected for p in Path(f).parents} | {'data', 'data/runs'}
+    allowed_dirs = {p.as_posix() for f in expected for p in Path(f).parents}
+    if meta['format'] == 1:
+        allowed_dirs.update(('data', 'data/runs'))
     for p in ROOT.rglob('*'):
         rel = p.relative_to(ROOT).as_posix()
         require(not p.is_symlink(), '目录下含符号链接，请先审阅')
         require(p.is_file() or p.is_dir(), '目录下含特殊文件，请先审阅')
-        if rel.startswith('data/runs/'):
+        if meta['format'] == 1 and rel.startswith('data/runs/'):
             require(p.parent == RUNS and p.is_file() and RUN_FILE.fullmatch(p.name), '结果目录中有本工具未识别的文件：' + rel)
         else:
             require(rel in (allowed_dirs if p.is_dir() else expected), '目录中有清单之外的文件：' + rel)
     return meta
 
-def save_results(target):
-    require(target.is_absolute() and target == target.parent.resolve() / target.name and ROOT not in target.parents and
-            target.parent.is_dir() and not os.path.lexists(target), '备份路径必须是安装目录外的全新绝对文件名')
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'wb') as stream:
-        try:
-            with tarfile.open(fileobj=stream, mode='w:gz') as tar:
-                tar.add(RUNS, arcname='runs')
-        except BaseException:
-            target.unlink()
-            raise
-    print('结果备份已写入', target)
+def purge_legacy_runs():
+    if RUNS.exists():
+        require(RUNS.resolve() == RUNS and not mounts_inside(RUNS), '旧结果目录含链接或挂载点')
+        for p in RUNS.iterdir():
+            require(regular(p) and RUN_FILE.fullmatch(p.name), '旧结果目录中有未知文件，请先检查')
+        for p in RUNS.iterdir():
+            p.unlink()
+        RUNS.rmdir()
+    if RUNS.parent.is_dir():
+        RUNS.parent.rmdir()
 
 def uninstall(opts):
-    verify_manifest()
+    meta = verify_manifest()
+    require(meta['format'] == 2, '旧安装请使用原版本自带的卸载器')
+    check_state_contents()
     if opts.check:
-        print('已核对目录、服务和账号归属。卸载预检通过。')
+        print('已核对目录、账号及两个 systemd 单元。')
         return
-    if RUNS.exists() and any(RUNS.iterdir()):
-        require(opts.backup_to or opts.purge_results, '存在检测结果。请指定 --backup-to /绝对路径/结果.tar.gz，或使用 --purge-results 删除结果。')
-    if UNIT.exists():
-        run('systemctl', 'disable', '--now', UNIT.name)
+    run('systemctl', 'disable', '--now', SOCKET.name)
+    run('systemctl', 'stop', UNIT.name)
     verify_manifest()
-    require(not (RUNS.exists() and any(RUNS.iterdir())) or opts.backup_to or opts.purge_results, '停止服务时产生新结果，请先备份或选择删除')
-    if opts.backup_to and RUNS.is_dir():
-        save_results(Path(opts.backup_to))
-    if UNIT.exists():
-        UNIT.unlink()
-        run('systemctl', 'daemon-reload')
+    remove_state(meta['state'], meta['uid'], meta['gid'])
+    SOCKET.unlink()
+    UNIT.unlink()
+    run('systemctl', 'daemon-reload')
     drop_user()
     drop_group()
     remove_new_tree()
-    print('已移除检测器服务、目录和专用账号。')
+    print('已移除检测器、回环监听和本机登录状态。')
 
 def main():
     os.umask(0o022)
@@ -275,9 +337,6 @@ def main():
     ins.add_argument('--check', action='store_true')
     un = modes.add_parser('uninstall')
     un.add_argument('--check', action='store_true')
-    keep = un.add_mutually_exclusive_group()
-    keep.add_argument('--backup-to')
-    keep.add_argument('--purge-results', action='store_true')
     args = parser.parse_args()
     if args.op == 'install':
         base = safe_base(args.sub2_url)
@@ -297,6 +356,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError, tarfile.TarError) as err:
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as err:
         print('部署工具已停止：', err, file=sys.stderr)
         sys.exit(1)

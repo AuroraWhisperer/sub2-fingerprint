@@ -1,4 +1,4 @@
-import { el, loadBank, renderRun, label, date, active } from "./results.js";
+import { el, loadBank, renderRun, date, active } from "./results.js";
 
 const $ = (id) => document.getElementById(id);
 let session = {},
@@ -50,19 +50,48 @@ async function api(path, body) {
   }
   return data;
 }
+async function syncSession() {
+  const previous = session;
+  const current = await api("/api/session");
+  if (session !== previous) return false;
+  if (
+    current.logged_in &&
+    (!previous.logged_in ||
+      (previous.epoch === current.epoch && previous.csrf !== current.csrf))
+  ) {
+    location.reload();
+    return false;
+  }
+  session = current;
+  applySession();
+  show("reconnect", false);
+  if (
+    (previous.logged_in || previous.needs_2fa) &&
+    !current.logged_in &&
+    !current.needs_2fa
+  )
+    notice("登录已失效，请重新登录。", true);
+  return current.logged_in;
+}
 async function failure(error) {
   notice(error.message || "操作失败，请重试。", true);
   if (String(error.code || "").startsWith("STEP_UP") && session.logged_in) {
     $("verify").open = true;
     $("stepForm").elements.code.focus();
   }
-  if (error.status === 401 || /csrf/i.test(error.code || "")) {
+  if (
+    error.status === 401 ||
+    ["CSRF", "STALE_SESSION", "NO_CHALLENGE", "ALREADY_LOGGED_IN"].includes(
+      error.code,
+    )
+  ) {
     try {
-      session = await api("/api/session");
-      applySession();
+      await syncSession();
     } catch {
       show("reconnect", true);
     }
+  } else if (!error.status || error.status >= 500) {
+    show("reconnect", true);
   }
 }
 function action(element, event, job) {
@@ -88,6 +117,11 @@ function action(element, event, job) {
   });
 }
 function applySession() {
+  const expires = session.logged_in && date(session.expires_at);
+  show("sessionInfo", Boolean(expires));
+  $("sessionInfo").textContent = expires
+    ? `${session.remembered ? "此浏览器保持登录至" : "本次登录有效至"} ${expires}`
+    : "";
   show("version", Boolean(session.version));
   if (session.version)
     $("version").textContent = `${session.version} · 版本与更新`;
@@ -111,7 +145,7 @@ function applySession() {
     lastRender = "";
     pendingSubmit = null;
     readyAccounts = readyQuestions = false;
-    for (const id of ["accounts", "questions", "result", "history"])
+    for (const id of ["accounts", "questions", "result"])
       $(id).replaceChildren();
   }
   updateStart();
@@ -212,12 +246,8 @@ async function questions() {
   updateStart();
 }
 const stopPoll = () => clearTimeout(pollTimer);
-function hashID() {
-  const value = location.hash.slice(1).replace(/^run\//, "");
-  return uuid.test(value) ? value : "";
-}
-function selectRun(id, updateURL = true) {
-  if (id && !uuid.test(id)) return;
+function selectRun(id) {
+  if (id && !uuid.test(id)) throw new Error("任务编号异常，请刷新本次结果。");
   stopPoll();
   ++revision;
   viewed = id;
@@ -226,41 +256,21 @@ function selectRun(id, updateURL = true) {
     el(
       "p",
       id
-        ? "正在读取检测记录…"
+        ? "正在读取本次结果…"
         : "完成检测后，在这里查看每个账号的答案与归因概率。",
       "empty",
     ),
   );
-  $("history").value = id;
   show("cancel", false);
-  if (updateURL)
-    history.replaceState(
-      null,
-      "",
-      location.pathname + (id ? `#run/${id}` : ""),
-    );
   if (id) return poll(revision);
 }
-async function historyList(preferred) {
+async function currentRun() {
+  const version = revision;
   const { runs } = await api("/api/runs");
-  preferred ??= viewed || hashID();
-  if (!session.logged_in) return;
-  const select = $("history");
-  select.replaceChildren(
-    ...runs.map(
-      (run) =>
-        new Option(
-          `${date(run.at)} · ${label(run.state)} · ${run.id.slice(0, 8)}`,
-          run.id,
-        ),
-    ),
-  );
-  if (!runs.length) select.add(new Option("暂无记录", ""));
-  const next = runs.some((r) => r.id === preferred)
-    ? preferred
-    : runs[0]?.id || "";
-  if (next !== viewed || !lastRender) await selectRun(next);
-  else select.value = next;
+  if (!session.logged_in || revision !== version) return;
+  const latest = runs[0]?.id || "";
+  if (latest && viewed === latest) return poll(version);
+  return selectRun(latest);
 }
 async function poll(version) {
   const runID = viewed;
@@ -275,9 +285,6 @@ async function poll(version) {
     if (imprint !== lastRender) {
       renderRun($("result"), run, bank, session.bank_version);
       lastRender = imprint;
-      for (const option of $("history").options)
-        if (option.value === run.id)
-          option.textContent = `${date(run.at)} · ${label(run.state)} · ${run.id.slice(0, 8)}`;
       if (
         run.rows.some(
           (row) =>
@@ -291,13 +298,12 @@ async function poll(version) {
     if (active(run.state)) pollTimer = setTimeout(() => poll(version), 3000);
   } catch (error) {
     if (version !== revision || sequence !== pollSequence) return;
-    await failure(error);
-    if (
-      version === revision &&
-      session.logged_in &&
-      (!error.status || error.status >= 500)
-    )
-      pollTimer = setTimeout(() => poll(version), 6000);
+    if (error.status === 404) {
+      selectRun("");
+      notice("服务器已清除本次检测结果。");
+    } else {
+      await failure(error);
+    }
   }
 }
 async function initialize() {
@@ -313,7 +319,7 @@ async function initialize() {
       updateStart();
     }),
   ]);
-  await historyList();
+  await currentRun();
   const failed = results.find((r) => r.status === "rejected");
   if (failed) {
     show("reconnect", true);
@@ -327,31 +333,53 @@ async function submitRun() {
     parallel: Number($("parallel").value),
   };
   const signature = JSON.stringify(payload);
-  // A lost submit response can be retried with the original idempotency key.
+  if (!(await syncSession())) return;
+  if (typeof session.epoch !== "string" || !session.epoch)
+    throw new Error("无法验证检测服务版本，请刷新页面后重试。");
+  // A retry of an unanswered submit belongs to its original server process.
   if (!pendingSubmit || pendingSubmit.signature !== signature)
-    pendingSubmit = { id: crypto.randomUUID(), signature };
+    pendingSubmit = {
+      id: crypto.randomUUID(),
+      epoch: session.epoch,
+      signature,
+    };
+  const attempt = pendingSubmit;
   let id;
   try {
-    ({ id } = await api("/api/runs", { ...payload, id: pendingSubmit.id }));
+    ({ id } = await api("/api/runs", {
+      ...payload,
+      id: attempt.id,
+      epoch: attempt.epoch,
+    }));
   } catch (error) {
-    if (error.status && error.status < 500) pendingSubmit = null;
+    if (error.status === 409 && error.code === "OLD_RUN")
+      error.message =
+        "检测服务已重启，上次请求不能自动重发。如需新的检测，请再次点击“开始检测”。";
+    if (error.status && error.status < 500 && error.code !== "CSRF")
+      pendingSubmit = null;
     throw error;
   }
-  if (!uuid.test(id))
-    throw new Error("任务编号异常。请刷新检测记录确认是否已经提交。");
+  if (pendingSubmit !== attempt) return;
+  if (id !== attempt.id)
+    throw new Error("任务编号异常，请刷新本次结果确认是否已经提交。");
   pendingSubmit = null;
-  history.replaceState(null, "", `${location.pathname}#run/${id}`);
-  await historyList(id);
   notice("检测已提交。");
+  await selectRun(id);
 }
 for (const id of ["accounts", "questions", "parallel"])
   $(id).addEventListener("change", updateStart);
-$("history").addEventListener("change", () => selectRun($("history").value));
 action($("loginForm"), "submit", async () => {
+  // A login form can outlive the anonymous session when the service sleeps.
+  session = await api("/api/session");
+  if (session.logged_in || session.needs_2fa) {
+    await initialize();
+    return;
+  }
   const form = $("loginForm").elements;
   const body = {
     email: form.email.value.trim(),
     password: form.password.value,
+    remember: form.remember.checked,
   };
   form.password.value = "";
   await api("/api/login", body);
@@ -375,15 +403,13 @@ for (const [id, path] of [
   });
 action($("logout"), "click", async () => {
   await api("/api/logout", {});
+  session = {};
+  applySession();
   await initialize();
   notice("已退出。");
 });
 action($("refreshAccounts"), "click", accounts);
-action($("reloadResults"), "click", async () => {
-  const previousRevision = revision;
-  await historyList();
-  if (viewed && revision === previousRevision) await poll(revision);
-});
+action($("reloadResults"), "click", currentRun);
 action($("runForm"), "submit", submitRun);
 action($("cancel"), "click", async () => {
   await api(`/api/runs/${viewed}/cancel`, {});
