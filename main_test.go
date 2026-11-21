@@ -116,7 +116,7 @@ func (b *testBrowser) post(p string, v any) (int, map[string]any, string) {
 }
 func testApp(t *testing.T) (*app, *isolatedSub2) {
 	t.Helper()
-	t.Setenv("STATE_DIRECTORY", t.TempDir())
+	t.Setenv("STATE_DIRECTORY", filepath.Join(t.TempDir(), "auth"))
 	m := newIsolatedSub2()
 	a, err := newApp(settings{Listen: "127.0.0.1:17861", Data: t.TempDir(), Parallel: 2}, m)
 	if err != nil {
