@@ -282,7 +282,7 @@ async function questions() {
   const rows = list.map((item, index) => {
     const choice = el("label", null, "q-card");
     choice.append(
-      checkbox(item.id, index === 0, false),
+      checkbox(item.id, index < 3, false),
       el("span", `挑战 ${item.number ?? index + 1}`, "name"),
     );
     return choice;
