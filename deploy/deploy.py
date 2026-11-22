@@ -231,7 +231,7 @@ def perform_install(base, files):
             os.chmod(path, 0o755 if src in (NAME, 'uninstall.sh', 'update.sh') else 0o644)
         (ROOT / 'config').mkdir(0o755)
         cf = ROOT / 'config/config.json'
-        jwrite(cf, {'sub2_url': base, 'parallel': 1, 'listen': f'127.0.0.1:{PORT}', 'data_dir': str(RUNS)}, 0o640)
+        jwrite(cf, {'sub2_url': base, 'parallel': 3, 'listen': f'127.0.0.1:{PORT}', 'data_dir': str(RUNS)}, 0o640)
         os.chown(cf, 0, group.gr_gid)
         state = create_state(user.pw_uid, group.gr_gid)
         undo.callback(remove_state, state, user.pw_uid, group.gr_gid)

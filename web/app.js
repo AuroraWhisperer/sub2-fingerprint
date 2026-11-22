@@ -136,8 +136,12 @@ function applySession() {
   $("authHint").textContent = session.needs_2fa
     ? "输入验证器生成的六位验证码。"
     : "使用管理员账号读取服务器上的 OpenAI 账号。";
-  $("parallel").options[1].disabled = !(session.parallel >= 2);
-  if (session.parallel < 2) $("parallel").value = "1";
+  const parallel = $("parallel");
+  const limit = [2, 3].includes(session.parallel) ? session.parallel : 1;
+  for (const option of parallel.options)
+    option.disabled = Number(option.value) > limit;
+  if (!parallel.value || parallel.selectedOptions[0].disabled)
+    parallel.value = "1";
   if (!session.logged_in) {
     stopPoll();
     ++revision;
@@ -334,6 +338,10 @@ async function submitRun() {
   };
   const signature = JSON.stringify(payload);
   if (!(await syncSession())) return;
+  if (payload.parallel !== Number($("parallel").value)) {
+    notice("服务器并发上限已变化，请按当前选项重新开始检测。", true);
+    return;
+  }
   if (typeof session.epoch !== "string" || !session.epoch)
     throw new Error("无法验证检测服务版本，请刷新页面后重试。");
   // A retry of an unanswered submit belongs to its original server process.

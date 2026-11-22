@@ -1,3 +1,3 @@
-v0.2.0 支持按需启动、空闲退出和可选的七天登录。当前批次的答案只保存在内存中，结果页完成后停止轮询。每道题单独请求，评分使用随包提供的 ModelTrace 指纹库。
+v0.2.1 支持最多三个账号同时检测。每批默认同时检测一个账号，可在页面选择两个或三个。同一账号会逐题发送独立请求，超过设定并发数的账号排队等待。
 
-已有 v0.1.0 的用户请下载并校验对应架构的新版包，从解压目录运行 `sudo sh ./install.sh --migrate --check` 和 `sudo sh ./install.sh --migrate`。确认新版健康后，安装器会清理旧检测记录。后续更新和无备份卸载见 [运维说明](https://github.com/AuroraWhisperer/sub2-fingerprint/blob/v0.2.0/deploy/DEPLOYMENT.md)。
+新安装的服务器允许在页面选择 1–3 个并发账号。已有安装使用 `sudo sh /opt/sub2-fingerprint/update.sh` 升级时会沿用原配置，需要开放三并发时将检测器配置中的 `parallel` 设为 `3`，下次进程启动即生效。[安装与运维说明](https://github.com/AuroraWhisperer/sub2-fingerprint/blob/v0.2.1/deploy/DEPLOYMENT.md)

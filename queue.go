@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+const maxParallelAccounts = 3
 const maxRowsText = 12 << 10
 const maxSeenSubmissions = 1024
 
@@ -195,7 +196,7 @@ func (q *queue) start(parent context.Context, owner int64, jwt string, req RunRe
 	if q.cancel != nil {
 		return errors.New("已有一批检测在运行，请等待完成")
 	}
-	if !uuidFormat.MatchString(req.ID) || len(qs) == 0 || len(qs) > 3 || len(req.Accounts) == 0 || len(req.Accounts) > 24 || req.Parallel < 1 || req.Parallel > 2 {
+	if !uuidFormat.MatchString(req.ID) || len(qs) == 0 || len(qs) > 3 || len(req.Accounts) == 0 || len(req.Accounts) > 24 || req.Parallel < 1 || req.Parallel > maxParallelAccounts {
 		return errors.New("检测规模无效")
 	}
 	r := &ownedRun{owner: owner, epoch: req.Epoch, Run: Run{Summary: Summary{req.ID, nowStamp(), "queued"}, BankVersion: q.version, Parallel: req.Parallel, Questions: append([]Question(nil), qs...)}}

@@ -1,6 +1,6 @@
 {
   "sub2_url": "http://127.0.0.1:8080",
   "listen": "127.0.0.1:17861",
-  "parallel": 1,
+  "parallel": 3,
   "data_dir": "/opt/sub2-fingerprint/data/runs"
 }

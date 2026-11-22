@@ -73,8 +73,8 @@ func newApp(cfg settings, api sub2) (*app, error) {
 		a.stateDir = cfg.Data + ".logins"
 	}
 	host, port, e := net.SplitHostPort(cfg.Listen)
-	if e != nil || host != "127.0.0.1" || port == "" || cfg.Parallel < 1 || cfg.Parallel > 2 || !filepath.IsAbs(cfg.Data) {
-		return nil, errors.New("config requires IPv4 loopback listen, parallel 1 or 2, and an absolute private data directory")
+	if e != nil || host != "127.0.0.1" || port == "" || cfg.Parallel < 1 || cfg.Parallel > maxParallelAccounts || !filepath.IsAbs(cfg.Data) {
+		return nil, fmt.Errorf("config requires IPv4 loopback listen, parallel from 1 to %d, and an absolute private data directory", maxParallelAccounts)
 	}
 	contents, e := assets.ReadFile("questions.json")
 	if e != nil {

@@ -116,9 +116,13 @@ func (b *testBrowser) post(p string, v any) (int, map[string]any, string) {
 }
 func testApp(t *testing.T) (*app, *isolatedSub2) {
 	t.Helper()
+	return testAppWithParallel(t, 1)
+}
+func testAppWithParallel(t *testing.T, parallel int) (*app, *isolatedSub2) {
+	t.Helper()
 	t.Setenv("STATE_DIRECTORY", filepath.Join(t.TempDir(), "auth"))
 	m := newIsolatedSub2()
-	a, err := newApp(settings{Listen: "127.0.0.1:17861", Data: t.TempDir(), Parallel: 2}, m)
+	a, err := newApp(settings{Listen: "127.0.0.1:17861", Data: t.TempDir(), Parallel: parallel}, m)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +156,8 @@ func waitRun(t *testing.T, q *queue, owner int64, id string) *Run {
 	return nil
 }
 func TestAdminSessionAndBoundedBatch(t *testing.T) {
-	a, m := testApp(t)
+	a, m := testAppWithParallel(t, 3)
+	m.listed = append(m.listed, AccountView{ID: 404, Name: "account four", Eligible: true})
 	b := testBrowser{t: t, a: a}
 	if c, _, _ := b.call("GET", "/api/accounts", nil, ""); c != 401 {
 		t.Fatal(c)
@@ -171,13 +176,26 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 		t.Fatal("reused anonymous session")
 	}
 	qs := a.groups[0]
-	req := RunRequest{Epoch: b.epoch, ID: "1eee2222-0000-4000-8000-000000000001", Parallel: 2, Accounts: []int64{101, 202, 303}, Questions: []string{qs[0].ID, qs[1].ID}}
+	req := RunRequest{Epoch: b.epoch, ID: "1eee2222-0000-4000-8000-000000000001", Parallel: 3, Accounts: []int64{101, 202, 303, 404}, Questions: []string{qs[0].ID, qs[1].ID}}
 	if c, _, txt := b.post("/api/runs", req); c != 202 {
 		t.Fatal(c, txt)
 	}
-	first, second := waitStart(t, m), waitStart(t, m)
-	if first == second {
-		t.Fatal("same worker twice")
+	waiting := map[int64]bool{101: true, 202: true, 303: true}
+	for range 3 {
+		id := waitStart(t, m)
+		if !waiting[id] {
+			t.Fatalf("unexpected account %d in first three probes", id)
+		}
+		delete(waiting, id)
+	}
+	pending, err := a.queue.get(11, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range pending.Rows {
+		if row.AccountID == 404 && row.Status != "queued" {
+			t.Fatal("fourth account started before a slot was free")
+		}
 	}
 	if c, _, _ := b.post("/api/runs", req); c != 200 {
 		t.Fatal("duplicate submit", c)
@@ -189,7 +207,7 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 	}
 	close(m.release)
 	r := waitRun(t, a.queue, 11, req.ID)
-	if len(r.Rows) != 6 || r.State != "done" {
+	if len(r.Rows) != 8 || r.State != "done" {
 		t.Fatal("wrong results")
 	}
 	for _, row := range r.Rows {
@@ -198,7 +216,7 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 		}
 	}
 	m.mu.Lock()
-	if m.peakActive != 2 || m.calls[101] != 2 || m.calls[202] != 2 || m.calls[303] != 2 {
+	if m.peakActive != 3 || m.calls[101] != 2 || m.calls[202] != 2 || m.calls[303] != 2 || m.calls[404] != 2 {
 		t.Errorf("unexpected upstream calls %v, peak %d", m.calls, m.peakActive)
 	}
 	m.mu.Unlock()
@@ -218,6 +236,32 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 		t.Fatal("history owner mismatch")
 	}
 }
+func TestConfiguredParallelLimits(t *testing.T) {
+	for _, limit := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("limit_%d", limit), func(t *testing.T) {
+			a, m := testAppWithParallel(t, limit)
+			b := testBrowser{t: t, a: a}
+			b.call("GET", "/api/session", nil, "")
+			if status, session, _ := b.post("/api/login", map[string]string{"email": "admin@example.com", "password": "fixture-password"}); status != http.StatusOK || session["parallel"] != float64(limit) {
+				t.Fatalf("expected configured limit %d in login response, got %v (HTTP %d)", limit, session["parallel"], status)
+			}
+			close(m.release)
+			req := RunRequest{Epoch: b.epoch, ID: "1eee2222-0000-4000-8000-000000000006", Parallel: limit + 1, Accounts: []int64{101}, Questions: []string{a.groups[0][0].ID}}
+			if status, body, _ := b.post("/api/runs", req); status != http.StatusBadRequest || body["code"] != "SELECTION" {
+				t.Errorf("configured limit %d allowed parallel %d: HTTP %d, code %v", limit, req.Parallel, status, body["code"])
+			}
+			a.queue.wg.Wait()
+			if len(m.calls) != 0 {
+				t.Fatal("over-limit request issued probes", m.calls)
+			}
+		})
+	}
+	cfg := settings{Listen: "127.0.0.1:17861", Data: t.TempDir(), Parallel: 4}
+	if _, err := newApp(cfg, newIsolatedSub2()); err == nil {
+		t.Fatal("accepted server configuration with parallel 4")
+	}
+}
+
 func TestStaleEpochDoesNotIssueProbe(t *testing.T) {
 	previous, _ := testApp(t)
 	previousBrowser := testBrowser{t: t, a: previous}

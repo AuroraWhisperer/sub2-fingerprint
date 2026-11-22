@@ -121,7 +121,7 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(self.active,{d.SOCKET})
         self.assertEqual(self.enabled,{d.SOCKET})
         self.assertFalse(d.RUNS.exists())
-        self.assertEqual(json.loads((d.ROOT/'config/config.json').read_text())['parallel'],1)
+        self.assertEqual(json.loads((d.ROOT/'config/config.json').read_text())['parallel'],3)
         session = d.STATE/('a'*64+'.session')
         session.write_bytes(b'fixture renewable session')
         return session
@@ -178,11 +178,12 @@ class Lifecycle(unittest.TestCase):
         session=self.install()
         self.active.clear(); self.enabled.clear()
         config=d.ROOT/'config/config.json'
-        config.write_text('{"parallel": 2, "local_override": true}')
+        existing = {"parallel": 1, "local_override": True}
+        config.write_text(json.dumps(existing))
         with patch.object(u,'health',side_effect=AssertionError('started inactive socket')):
             self.apply()
         self.assertEqual(u.file_version(d.ROOT/'VERSION'),(0,2,1))
-        self.assertTrue(json.loads(config.read_text())['local_override'])
+        self.assertEqual(json.loads(config.read_text()), existing)
         self.assertEqual(session.read_bytes(),b'fixture renewable session')
         self.assertFalse(self.active or self.enabled or (d.ROOT/'.rollback').exists())
         d.verify_manifest()

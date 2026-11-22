@@ -38,7 +38,7 @@ sudo sh ./install.sh --sub2-url "$SUB2_URL"
 ssh -N -T -a -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -L 127.0.0.1:17861:127.0.0.1:17861 my-server
 ```
 
-访问 `http://127.0.0.1:17861/`，先选一个空闲账号和一道题。测试时可查看 `free -m` 和已有业务响应。并发默认 1，配置文件为 `/opt/sub2-fingerprint/config/config.json`。确有余量时，可将 parallel 改为 2，待当前检测结束，再停下正在运行的 service，下一次访问时生效。512 MB 主机应以实际 MemAvailable、交换和延迟为准。工作进程限制为 MemoryHigh=64M、MemoryMax=96M 和 CPUQuota=20%。
+访问 `http://127.0.0.1:17861/`，先选一个空闲账号和一道题。测试时可查看 `free -m` 和已有业务响应。每批检测默认一次测 1 个账号。新安装最多可同时测 3 个不同账号，同一账号的题目依次执行。服务器配置 `/opt/sub2-fingerprint/config/config.json` 中的 `parallel` 控制这个上限。升级会保留原有的 1 或 2。如果需要调整，可将 `parallel` 设为 1、2 或 3，待当前批次结束后停止检测服务，下次打开页面时生效。512 MB 主机应以实际 MemAvailable、交换和延迟为准。工作进程限制为 MemoryHigh=64M、MemoryMax=96M 和 CPUQuota=20%。
 
 ```sh
 systemctl is-active sub2-fingerprint.socket
