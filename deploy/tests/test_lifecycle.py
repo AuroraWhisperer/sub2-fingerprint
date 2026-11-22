@@ -53,7 +53,10 @@ class Lifecycle(unittest.TestCase):
         state = self.tmp/'var/lib'/d.NAME
         state.parent.mkdir(parents=True)
         self.stack.enter_context(patch.multiple(d, ROOT=root, UNIT=unit, SOCKET=sock, STATE=state, RUNS=root/'data/runs',
+                                                RUNTIME=root.with_name(d.NAME+'-runtime'),
                                                 MARKER=root/'install-manifest.json', BUNDLE=self.vendor))
+        if os.name == 'nt':
+            self.stack.enter_context(patch.object(u, 'SYSTEM_ZSTD', u.shutil.which('zstd') or 'zstd.exe'))
         self.user = None
         self.group = None
         self.commands = []
@@ -150,6 +153,97 @@ class Lifecycle(unittest.TestCase):
 
     def apply(self):
         u.apply(self.successor, d.bundle_files(self.successor), d.verify_manifest(), d.ROOT/'.rollback')
+
+    @contextlib.contextmanager
+    def runtime_release(self, content, machine=62, bad_archive=False, bad_plain=False):
+        plain = b'\x7fELF\x02\x01' + bytes(12) + machine.to_bytes(2, 'little') + content
+        # One small raw block in a real zstd frame. Test fixtures require no compressor or network.
+        compressed = (b'\x28\xb5\x2f\xfd\x20' + bytes([len(plain)]) +
+                      ((len(plain) << 3) | 1).to_bytes(3, 'little') + plain)
+        pin = (len(compressed), hashlib.sha256(compressed).hexdigest(), len(plain),
+               '0'*64 if bad_plain else hashlib.sha256(plain).hexdigest())
+        with patch.object(u.platform, 'machine', return_value='x86_64'), patch.dict(u.RUNTIME_ASSETS, x86_64=pin), \
+                patch.object(u, 'http', side_effect=lambda url: io.BytesIO(compressed[:-1] if bad_archive else compressed)) as fetch:
+            yield plain, fetch
+
+    def test_runtime_installs_once_updates_and_uninstalls_only_owned_files(self):
+        session = self.install()
+        neighbor = d.RUNTIME.parent/'other-project'
+        neighbor.write_bytes(b'keep')
+        binary = d.RUNTIME/d.RUNTIME_BINARY
+        with self.runtime_release(b'first') as (first, fetch):
+            u.install_runtime()
+            self.assertEqual(binary.read_bytes(), first)
+            u.install_runtime()
+            fetch.assert_called_once_with('https://github.com/openai/codex/releases/download/' + u.RUNTIME_TAG +
+                                          '/codex-app-server-x86_64-unknown-linux-musl.zst')
+        with patch.object(u,'health'):
+            self.apply()
+        self.assertEqual(binary.read_bytes(), first)
+        with self.runtime_release(b'successor') as (second, _):
+            u.install_runtime()
+            self.assertEqual(binary.read_bytes(), second)
+            self.assertEqual(d.verify_runtime()['sha256'], hashlib.sha256(second).hexdigest())
+        self.assertEqual({p.name for p in d.RUNTIME.iterdir()}, {d.RUNTIME_MARKER, d.RUNTIME_BINARY})
+        self.assertTrue(session.exists())
+        d.uninstall(SimpleNamespace(check=True))
+        self.assertTrue(binary.is_file())
+        d.uninstall(SimpleNamespace(check=False))
+        self.assertFalse(any(p.exists() for p in (d.RUNTIME, d.ROOT, d.STATE)))
+        self.assertEqual(neighbor.read_bytes(), b'keep')
+        self.assertFalse(list(neighbor.parent.glob('.sub2-fingerprint-runtime-*')))
+
+    def test_runtime_failed_or_interrupted_update_preserves_verified_executable(self):
+        self.install()
+        binary = d.RUNTIME/d.RUNTIME_BINARY
+        with self.runtime_release(b'original') as (original, _):
+            u.install_runtime()
+        original_id = d.verify_runtime()
+        for changes in ({'bad_archive': True}, {'bad_plain': True}, {'machine': 183}):
+            with self.subTest(changes=changes), self.runtime_release(b'bad-update', **changes), self.assertRaises(ValueError):
+                u.install_runtime()
+            self.assertEqual(binary.read_bytes(), original)
+            self.assertEqual(d.verify_runtime(), original_id)
+        replace = os.replace
+        def interrupt(src, dest):
+            if dest == binary:
+                raise OSError('interrupted before binary rename')
+            replace(src, dest)
+        with self.runtime_release(b'successor') as (second, _):
+            with patch.object(os, 'replace', side_effect=interrupt), self.assertRaisesRegex(OSError, 'interrupted'):
+                u.install_runtime()
+            self.assertEqual(d.verify_runtime(), original_id)
+            u.install_runtime()
+            self.assertEqual(binary.read_bytes(), second)
+        self.assertFalse(list(d.RUNTIME.parent.glob('.sub2-fingerprint-runtime-*')))
+
+    def test_runtime_refuses_unowned_directory_unknown_file_and_changed_binary(self):
+        session = self.install()
+        d.RUNTIME.mkdir()
+        foreign = d.RUNTIME/'personal-file'
+        foreign.write_bytes(b'keep')
+        with self.runtime_release(b'owned') as (_, fetch):
+            with self.assertRaises(ValueError):
+                u.install_runtime()
+            fetch.assert_not_called()
+            self.assertEqual(foreign.read_bytes(), b'keep')
+            foreign.unlink(); d.RUNTIME.rmdir()
+            u.install_runtime()
+        foreign.write_bytes(b'keep')
+        with self.assertRaises(ValueError):
+            d.uninstall(SimpleNamespace(check=False))
+        self.assertEqual(foreign.read_bytes(), b'keep')
+        foreign.unlink()
+        binary = d.RUNTIME/d.RUNTIME_BINARY
+        binary.write_bytes(b'locally replaced')
+        with self.runtime_release(b'update') as (_, fetch), self.assertRaises(ValueError):
+            u.install_runtime()
+        fetch.assert_not_called()
+        with self.assertRaises(ValueError):
+            d.uninstall(SimpleNamespace(check=False))
+        self.assertTrue(session.exists())
+        self.assertEqual(binary.read_bytes(), b'locally replaced')
+        self.assertFalse(any(cmd[:2] == ('systemctl','stop') for cmd in self.commands))
 
     def test_failed_fresh_install_removes_only_new_resources(self):
         neighbor = d.ROOT.parent/'sub2api'

@@ -95,11 +95,11 @@
                 <option value="1">1 个账号</option>
                 <option value="2" disabled>2 个账号</option>
                 <option value="3" disabled>3 个账号</option></select
-              ><button type="submit" class="primary" id="start" disabled>
+              ><button type="submit" class="primary" id="start" aria-describedby="estimate" disabled>
                 开始检测
               </button>
             </div>
-            <p class="footnote" id="estimate">请选择账号。</p>
+            <p class="footnote" id="estimate" aria-live="polite">请选择账号。</p>
           </form>
           <details class="verify" id="verify">
             <summary>验证敏感操作</summary>
@@ -128,6 +128,10 @@
           <p class="footnote retention">
             开始下一批检测或服务空闲退出后，服务器会清除本批结果。
           </p>
+          <div id="bankStatus" class="footnote" aria-live="polite" hidden>
+            <span id="bankMessage"></span>
+            <button type="button" id="retryBank" class="link" hidden>重新加载指纹库</button>
+          </div>
           <div id="result" aria-busy="false">
             <p class="empty">
               完成检测后，在这里查看每个账号的答案与归因概率。

@@ -88,7 +88,7 @@ func TestAdapterSelectedAccountAndIndependentAnswers(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer bearer-"+id || r.Header.Get("ChatGPT-Account-Id") != "identity-"+id {
 			t.Error("account identity crossed")
 		}
-		sid := r.Header.Get("Session_id")
+		sid := r.Header.Get("Session-Id")
 		lock.Lock()
 		sessions = append(sessions, sid)
 		lock.Unlock()
@@ -101,6 +101,7 @@ func TestAdapterSelectedAccountAndIndependentAnswers(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.upstream = upstream.URL
+	a.runCodex = fixtureCodexTurn
 	a.upstreamTransport = upstream.Client().Transport.(*http.Transport)
 	var wg sync.WaitGroup
 	for _, id := range []int64{9, 17, 9} {
@@ -428,4 +429,19 @@ func TestAdminBadRequestShowsStageWithoutEchoingPrivateDetails(t *testing.T) {
 			t.Fatal("admin diagnostics lost the HTTP status or exposed remote content", tc.code)
 		}
 	}
+}
+
+func TestProbeStreamScoresOnlyTheFinalAnswer(t *testing.T) {
+	const note = `{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Thinking about 999"}]}`
+	const final = `{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"42"}]}`
+	frame := func(s string) string { return "data: " + s + "\n\n" }
+	streamed := frame(`{"type":"response.output_item.done","item":`+note+`}`) + frame(`{"type":"response.output_item.done","item":`+final+`}`)
+	for _, end := range []string{`[]`, `[` + note + `,` + final + `]`} {
+		answer, err := readProbeStream(strings.NewReader(streamed + frame(`{"type":"response.completed","response":{"status":"completed","model":"gpt-6-astra","output":`+end+`}}`)))
+		if err != nil || answer.Text != "42" {
+			t.Fatalf("incorrect final answer: %q, %v", answer.Text, err)
+		}
+	}
+	_, err := readProbeStream(strings.NewReader(frame(`{"type":"response.output_text.delta","delta":"Thinking about 999"}`) + frame(`{"type":"response.completed","response":{"status":"completed","output":[`+note+`]}}`)))
+	assertGate(t, err, "UPSTREAM_INCOMPLETE")
 }

@@ -4,15 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,6 +22,7 @@ import (
 const (
 	probeModel        = "gpt-6-astra"
 	responsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
+	codexRuntimePath  = "/opt/sub2-fingerprint-runtime/codex-app-server"
 	apiLimit          = 3 << 20
 	answerLimit       = 32 << 10
 )
@@ -60,6 +58,8 @@ type Adapter struct {
 	admin             *http.Client
 	upstream          string // fixed in production; isolated TLS server in tests
 	upstreamTransport *http.Transport
+	codexBinary       string
+	runCodex          func(context.Context, string, string, string, string, string) error
 }
 
 func newTransport() *http.Transport {
@@ -81,7 +81,7 @@ func NewAdapter(base string) (*Adapter, error) {
 		return nil, gate("CONFIG", "请使用 Sub2API 站点地址或 /api/v1")
 	}
 	parsed.Path = "/api/v1"
-	return &Adapter{base: parsed.String(), admin: &http.Client{Transport: newTransport(), Timeout: 18 * time.Second, CheckRedirect: rejectRedirect}, upstream: responsesEndpoint, upstreamTransport: newTransport()}, nil
+	return &Adapter{base: parsed.String(), admin: &http.Client{Transport: newTransport(), Timeout: 18 * time.Second, CheckRedirect: rejectRedirect}, upstream: responsesEndpoint, upstreamTransport: newTransport(), codexBinary: codexRuntimePath, runCodex: runCodexProcess}, nil
 }
 
 func httpFailure(ctx context.Context, err error, side string) error {
@@ -587,9 +587,6 @@ func requestHeaders(detail accountData, cred credentialData, now time.Time) (htt
 	h := make(http.Header)
 	h.Set("Authorization", "Bearer "+cred.Token)
 	h.Set("ChatGPT-Account-Id", id)
-	h.Set("Content-Type", "application/json")
-	h.Set("Accept", "text/event-stream")
-	h.Set("OpenAI-Beta", "responses=experimental")
 	fed := strings.Trim(string(cred.FedRAMP), "\"")
 	switch strings.ToLower(fed) {
 	case "true", "1":
@@ -598,18 +595,12 @@ func requestHeaders(detail accountData, cred credentialData, now time.Time) (htt
 	default:
 		return nil, invalid
 	}
-	// Use the account-configured identity when present. Label this integration in the default protocol UA.
-	ua := cred.UA
-	if ua == "" {
-		ua = "sub2-fingerprint/" + strings.TrimPrefix(strings.TrimSpace(releaseVersion), "v")
+	if cred.UA != "" {
+		if !clientUA.MatchString(cred.UA) || len(cred.UA) > 512 || !headerValue.MatchString(cred.UA) {
+			return nil, gate("IDENTITY", "账号客户端标识无法安全匹配")
+		}
+		h.Set("User-Agent", cred.UA)
 	}
-	m := clientUA.FindStringSubmatch(ua)
-	if len(m) != 3 || len(ua) > 512 || !headerValue.MatchString(ua) {
-		return nil, gate("IDENTITY", "账号客户端标识无法安全匹配")
-	}
-	h.Set("User-Agent", ua)
-	h.Set("Originator", m[1])
-	h.Set("Version", m[2])
 	return h, nil
 }
 
@@ -653,69 +644,7 @@ func (a *Adapter) Probe(ctx context.Context, jwt string, id int64, prompt string
 	if err != nil {
 		return empty, err
 	}
-	wire := map[string]any{
-		"model": probeModel, "reasoning": map[string]string{"effort": "low"},
-		"include":      []string{"reasoning.encrypted_content"},
-		"instructions": "Answer the user’s numerical challenge directly. Do not use tools.",
-		"input":        []any{map[string]any{"role": "user", "content": []any{map[string]string{"type": "input_text", "text": prompt}}}},
-		"stream":       true, "store": false,
-	}
-	body, err := json.Marshal(wire)
-	if err != nil {
-		return empty, gate("INVALID", "题目无法编码")
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.upstream, bytes.NewReader(body))
-	if err != nil {
-		return empty, gate("CONFIG", "上游地址无效")
-	}
-	req.Header = headers
-	var nonce [16]byte
-	if _, err = rand.Read(nonce[:]); err != nil {
-		return empty, gate("RANDOM", "无法生成独立请求标识")
-	}
-	nonce[6] = (nonce[6] & 0x0f) | 0x40
-	nonce[8] = (nonce[8] & 0x3f) | 0x80
-	s := hex.EncodeToString(nonce[:])
-	requestID := s[:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:]
-	req.Header.Set("Session_id", requestID)
-	transport := a.upstreamTransport.Clone()
-	transport.DisableKeepAlives = true
-	if proxy != nil {
-		transport.Proxy = http.ProxyURL(proxy)
-	}
-	defer transport.CloseIdleConnections()
-	client := http.Client{Transport: transport, CheckRedirect: rejectRedirect}
-	resp, err := client.Do(req)
-	if err != nil {
-		return empty, httpFailure(ctx, err, "上游 ")
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case 200:
-	case http.StatusBadRequest:
-		return empty, upstreamBadRequest(resp)
-	case 401:
-		return empty, gate("UPSTREAM_TOKEN", "上游拒绝账号凭据，请在 Sub2API 核对后重试")
-	case 403:
-		return empty, gate("UPSTREAM_FORBIDDEN", "上游拒绝当前账号或客户端请求")
-	case 429:
-		return empty, gate("UPSTREAM_RATE_LIMIT", "账号已被上游限流，请稍后重试")
-	default:
-		return empty, gate("UPSTREAM_HTTP", fmt.Sprintf("上游返回 HTTP %d", resp.StatusCode))
-	}
-	mediatype, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if mediatype != "text/event-stream" {
-		return empty, gate("UPSTREAM_FORMAT", "上游未返回预期的事件流")
-	}
-	result, err := readProbeStream(resp.Body)
-	if err != nil {
-		if ctx.Err() != nil {
-			return empty, httpFailure(ctx, ctx.Err(), "上游 ")
-		}
-		return empty, err
-	}
-	result.RequestID = requestID
-	return result, nil
+	return a.probeWithCodex(ctx, headers, proxy, prompt)
 }
 
 // Provider messages sometimes echo input or credentials. Classify them locally and
@@ -893,23 +822,42 @@ func upstreamBadRequest(resp *http.Response) error {
 	return gate("UPSTREAM_BAD_REQUEST", source+"拒绝本次请求，未给出可识别的具体原因")
 }
 
+type responseItem struct {
+	Type, Role, Phase string
+	Content           []struct{ Type, Text string }
+}
+
+func (item responseItem) finalText() (string, error) {
+	if item.Type == "reasoning" || item.Type == "message" && item.Role == "assistant" && item.Phase == "commentary" {
+		return "", nil
+	}
+	if item.Type != "message" || item.Role != "assistant" || item.Phase != "" && item.Phase != "final_answer" {
+		return "", gate("UPSTREAM_REFUSAL", "上游返回了非答案内容，本题未计分")
+	}
+	var text strings.Builder
+	for _, part := range item.Content {
+		if part.Type != "output_text" {
+			return "", gate("UPSTREAM_REFUSAL", "上游拒答或返回工具内容，本题未计分")
+		}
+		if text.Len()+len(part.Text) > answerLimit {
+			return "", gate("UPSTREAM_SIZE", "上游响应超过大小限制")
+		}
+		text.WriteString(part.Text)
+	}
+	return text.String(), nil
+}
+
 type responseEvent struct {
-	providerProblem                 // Some error events put code, param and message directly on the event.
+	providerProblem                 // Some error events put the code and message directly on the event.
 	Type            string          `json:"type"`
 	Delta           string          `json:"delta"`
+	Item            responseItem    `json:"item"`
 	Error           providerProblem `json:"error"`
 	Response        struct {
 		Status string          `json:"status"`
 		Model  string          `json:"model"`
 		Error  providerProblem `json:"error"`
-		Output []struct {
-			Type    string `json:"type"`
-			Role    string `json:"role"`
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"output"`
+		Output []responseItem  `json:"output"`
 	} `json:"response"`
 }
 
@@ -922,6 +870,8 @@ func readProbeStream(reader io.Reader) (ProbeAnswer, error) {
 	scanner := bufio.NewScanner(limited)
 	scanner.Buffer(make([]byte, 4096), 128<<10)
 	var delta, frame strings.Builder
+	var streamedAnswer string
+	var sawItem bool
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data:") {
@@ -957,6 +907,18 @@ func readProbeStream(reader io.Reader) (ProbeAnswer, error) {
 			return empty, incomplete
 		case "response.refusal.delta", "response.refusal.done", "response.function_call_arguments.delta", "response.function_call_arguments.done":
 			return empty, refusal
+		case "response.output_item.added", "response.output_item.done":
+			sawItem = true
+			text, err := ev.Item.finalText()
+			if err != nil {
+				return empty, err
+			}
+			if ev.Type == "response.output_item.done" && text != "" {
+				if streamedAnswer != "" {
+					return empty, incomplete
+				}
+				streamedAnswer = text
+			}
 		case "response.output_text.delta":
 			if delta.Len()+len(ev.Delta) > answerLimit {
 				return empty, large
@@ -966,26 +928,25 @@ func readProbeStream(reader io.Reader) (ProbeAnswer, error) {
 			if limited.N <= 0 || ev.Response.Status != "completed" {
 				return empty, incomplete
 			}
-			var text strings.Builder
+			var result string
 			for _, item := range ev.Response.Output {
-				if item.Type == "reasoning" {
-					continue
+				text, err := item.finalText()
+				if err != nil {
+					return empty, err
 				}
-				if item.Type != "message" || item.Role != "assistant" {
-					return empty, refusal
-				}
-				for _, part := range item.Content {
-					if part.Type != "output_text" {
-						return empty, refusal
+				if text != "" {
+					if result != "" {
+						return empty, incomplete
 					}
-					if text.Len()+len(part.Text) > answerLimit {
-						return empty, large
-					}
-					text.WriteString(part.Text)
+					result = text
 				}
 			}
-			result := text.String()
-			if result == "" {
+			if streamedAnswer != "" {
+				if result != "" && result != streamedAnswer {
+					return empty, incomplete
+				}
+				result = streamedAnswer
+			} else if result == "" && !sawItem && len(ev.Response.Output) == 0 {
 				result = delta.String()
 			}
 			if strings.TrimSpace(result) == "" {

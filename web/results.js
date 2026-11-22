@@ -15,7 +15,7 @@ async function readBank() {
   const response = await fetch("/unified_bank.json", {
     credentials: "same-origin",
   });
-  if (!response.ok) throw new Error("无法读取指纹库。请刷新页面后重试。");
+  if (!response.ok) throw new Error("无法读取指纹库。");
   const bytes = await response.arrayBuffer();
   const sum = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   const hash = Array.from(sum, (byte) =>
@@ -180,15 +180,15 @@ export function renderRun(container, run, bank, bankVersion) {
     run.bank_version && run.bank_version === bankVersion && bank,
   );
   const pending = active(run.state);
-  if (!compatible)
+  if (!run.bank_version || run.bank_version !== bankVersion)
     out.append(
       el(
         "p",
-        "当前评分库与记录版本不一致或不可用，请查看原始答案。",
+        "当前评分库与本批次的版本不一致，请查看原始答案。",
         "warning",
       ),
     );
-  else if (pending)
+  else if (pending && bank)
     out.append(el("p", "本批检测结束后计算各账号的归因概率。", "small"));
   for (const { id, rows, result } of accountReports(
     run.rows,

@@ -75,6 +75,7 @@ func TestProbePreservesReasonsForUpstreamFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			adapter.upstream, adapter.upstreamTransport = upstream.URL, upstream.Client().Transport.(*http.Transport)
+			adapter.runCodex = fixtureCodexTurn
 			answer, err := adapter.Probe(context.Background(), "fixture", 8, "fixture challenge")
 			assertGate(t, err, tc.code)
 			if strings.Contains(err.Error(), requestRef) != (tc.name == "model") {

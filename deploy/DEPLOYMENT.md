@@ -24,9 +24,19 @@ SUB2_URL='http://127.0.0.1:8080'
 curl -sS --max-time 8 -o /dev/null -w 'Sub2API HTTP %{http_code}\n' "$SUB2_URL/api/v1/admin/accounts?page=1&page_size=1&lite=1"
 sudo sh ./install.sh --check --sub2-url "$SUB2_URL"
 sudo sh ./install.sh --sub2-url "$SUB2_URL"
+sudo sh /opt/sub2-fingerprint/update.sh --install-runtime
 ```
 
 上述未授权的 API 请求应返回 401。外部站点使用 HTTPS。安装会建立专用系统账号、两个 systemd 单元及一个回环监听。程序和配置在 `/opt/sub2-fingerprint`。勾选记住登录后，服务器续期凭据以 0600 权限写入 `/var/lib/sub2-fingerprint`，目录权限为 0700。浏览器持有随机的 HttpOnly 会话标识，最长七天。在页面退出可立即注销该浏览器的会话。正常重启后，勾选过记住登录并且仍获 Sub2API 授权的会话可以恢复。未勾选时需重新登录。
+
+最后一条命令为账号测试安装官方 `codex-app-server`。它根据 CPU 下载 OpenAI 发布的 `rust-v0.164.0`，校验压缩包的长度和 SHA-256，再调用 `/usr/bin/zstd` 流式解压，确认 ELF 架构、长度及 SHA-256 后才启用。安装需要系统的 `zstd` 命令。重复执行会核对现有程序，相同版本只读取本机文件。[OpenAI 官方发布](https://github.com/openai/codex/releases/tag/rust-v0.164.0)
+
+| Linux 架构 | `/opt` 安装或替换时所需可用磁盘 | 安装后运行时占用 |
+| --- | ---: | ---: |
+| x86_64 / amd64 | 289 MiB | 约 228 MiB |
+| aarch64 / arm64 | 256 MiB | 约 198 MiB |
+
+安装器在 `/opt` 的私有临时目录下载和解压，结束后清理压缩包。`/opt/sub2-fingerprint-runtime/` 只保留 `codex-app-server` 和一份小型归属清单。每道题启动独立的官方客户端，临时目录位于 `/run/sub2-fingerprint/`，仅服务账号可访问。systemd 在服务停止时清理该目录。可用 `findmnt -T /run -o TARGET,FSTYPE` 核对主机的 `/run` 使用 tmpfs。
 
 ## 打开与验收
 
@@ -36,7 +46,7 @@ Windows 用户解压本次发布的 `sub2-fingerprint-windows-amd64.zip`。在 `
 ssh -N -T -a -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -L 127.0.0.1:17861:127.0.0.1:17861 my-server
 ```
 
-访问 `http://127.0.0.1:17861/`，先选一个有可用容量的账号和一道题。测试时可查看 `free -m` 和已有业务响应。每批检测默认一次测 1 个账号。新安装最多可同时测 3 个不同账号，同一账号的题目依次执行。服务器配置 `/opt/sub2-fingerprint/config/config.json` 中的 `parallel` 控制这个上限。升级会保留原有的 1 或 2。如果需要调整，可将 `parallel` 设为 1、2 或 3，待当前批次结束并让检测器自然退出，下次启动时生效。512 MB 主机应以实际 MemAvailable、交换和延迟为准。工作进程限制为 MemoryHigh=64M、MemoryMax=96M 和 CPUQuota=20%。
+访问 `http://127.0.0.1:17861/`，先选一个账号和一道题。有空位的账号可以立即测试，满额账号可勾选并等待空位。测试时可查看 `free -m` 和已有业务响应。每批检测默认一次测 1 个账号。新安装最多可同时测 3 个不同账号，同一账号的题目依次执行。服务器配置 `/opt/sub2-fingerprint/config/config.json` 中的 `parallel` 控制这个上限。升级会保留原有的 1 或 2。如果需要调整，可将 `parallel` 设为 1、2 或 3，待当前批次结束并让检测器自然退出，下次启动时生效。512 MB 主机应以高峰期间实际 `MemAvailable` 和业务延迟为准。Go 检测器与它启动的所有子进程共同使用 88 MiB 内存软阈值、96 MiB 硬上限和 20% CPU 配额，服务禁用交换空间。128 个系统任务名额包括运行时的线程。三个官方客户端同时冷启动时，64 MiB 软阈值触发的内存回收曾使测试超时。将软阈值调整为 88 MiB 后，三客户端冷启动和热启动均通过，实测峰值约 89 MiB，交换用量和内存不足终止次数均为零。这个峰值来自当次并发测试。
 
 ```sh
 systemctl is-active sub2-fingerprint.socket
@@ -54,9 +64,10 @@ systemctl show sub2-fingerprint.service -p MainPID -p MemoryCurrent
 ```sh
 sudo sh /opt/sub2-fingerprint/update.sh --check
 sudo sh /opt/sub2-fingerprint/update.sh
+sudo sh /opt/sub2-fingerprint/update.sh --install-runtime
 ```
 
-无法连到 GitHub 时，用 `sudo sh /opt/sub2-fingerprint/update.sh --archive /绝对路径/发布包.tar.gz --sha256 该包的64位哈希` 验证并安装本地包。若有未完成的更新，运行 `sudo sh /opt/sub2-fingerprint/update.sh --recover`。用于恢复的软件快照仅包含受管程序和 systemd 文件，成功后清除。检测答案和服务器续期凭据均不进入快照。
+v0.2.2 用户先用原有更新命令装上新版检测器，随后再执行 `--install-runtime`。检测器和官方运行时分别更新，运行时下载失败可重试同一条命令，替换失败时已安装的运行时仍可识别。无法连到 GitHub 时，用 `sudo sh /opt/sub2-fingerprint/update.sh --archive /绝对路径/发布包.tar.gz --sha256 该包的64位哈希` 验证并安装本地检测器包。若有未完成的检测器更新，运行 `sudo sh /opt/sub2-fingerprint/update.sh --recover`。用于恢复的软件快照仅包含受管程序和 systemd 文件，成功后清除。检测答案和服务器续期凭据均不进入快照。
 
 ## 暂停和卸载
 
@@ -67,7 +78,7 @@ sudo systemctl stop sub2-fingerprint.socket sub2-fingerprint.service
 sudo systemctl start sub2-fingerprint.socket
 ```
 
-彻底移除时，可先在检测页面退出登录，然后执行下面的命令。卸载器会核对清单、UID/GID、单元哈希、目录身份、链接和挂载点，删除检测器自己的程序、socket、专用账号和私有登录状态。遇到归属不符或不认识的文件时会停止，请先检查。完成后重新打开原 Sub2API，核对账号列表和正常业务。
+彻底移除时，可先在检测页面退出登录，然后执行下面的命令。卸载器会核对清单、UID/GID、单元哈希、目录身份、链接和挂载点，删除检测器自己的程序、socket、专用账号和私有登录状态。若安装了官方运行时，还会核对其归属清单、文件身份和 SHA-256，移除 `/opt/sub2-fingerprint-runtime/`。遇到归属不符或不认识的文件时会停止，请先检查。完成后重新打开原 Sub2API，核对账号列表和正常业务。
 
 ```sh
 sudo sh /opt/sub2-fingerprint/uninstall.sh --check

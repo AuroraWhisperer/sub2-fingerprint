@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -24,6 +25,15 @@ REPO = 'AuroraWhisperer/sub2-fingerprint'
 API = 'https://api.github.com/repos/' + REPO + '/releases/latest'
 ARCHIVE_LIMIT = 64 << 20
 PLAIN_LIMIT = 96 << 20
+RUNTIME_TAG = 'rust-v0.164.0'
+# Compressed length and SHA-256 from the upstream release, then the expanded ELF length and SHA-256.
+RUNTIME_ASSETS = {
+    'x86_64': (63228493, '7aefc55b1f0e31cabe2d02fa02c969d8b1602c97d239b2fe6ba82660567b84c3',
+               238625528, '27e9426359a5b34b8de3c10efd60765924929b6a61ea8d2b8b4e05c00abad6bc'),
+    'aarch64': (59458822, 'dcad6259185a33872d28788f17c9387d5ccb1b7136342ee3e14d2aba372dc4d7',
+                207805160, 'b24c7d899435ae236dac6f39a10cfb87effd207fcf805571cbd1c2b854cb11e2'),
+}
+SYSTEM_ZSTD = '/usr/bin/zstd'
 
 def version(value):
     m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', value.strip())
@@ -92,6 +102,61 @@ def acquire(src, target, sha, size=None):
             h.update(block)
             out.write(block)
     d.require(h.hexdigest() == sha and (size is None or count == size), '整包 SHA256 或长度不匹配')
+
+def expand_runtime(archive, binary, expected_size, expected_sha):
+    # acquire() has already verified the exact compressed input. The official frames use an 8 MiB window.
+    with archive.open('rb') as inp, binary.open('xb') as out:
+        result = subprocess.run([SYSTEM_ZSTD, '-qdc', '-M16MB'], stdin=inp, stdout=out,
+                                stderr=subprocess.PIPE, timeout=300)
+        d.require(result.returncode == 0, '官方运行时 zstd 解压失败')
+        d.require(out.tell() == expected_size, '运行时解压后的长度不匹配')
+        os.chmod(binary, 0o755)
+        os.fsync(out.fileno())
+    d.require(d.digest(binary) == expected_sha, '运行时解压后的 SHA256 不匹配')
+
+def install_runtime():
+    arch = platform.machine()
+    d.require(arch in RUNTIME_ASSETS, '官方运行时支持 x86_64 和 aarch64 Linux')
+    size, sha, plain_size, plain_sha = RUNTIME_ASSETS[arch]
+    current = d.verify_runtime()
+    if current and current['sha256'] == plain_sha:
+        print('已安装并校验官方 Codex 运行时', RUNTIME_TAG)
+        return
+    if not current:
+        d.vacant(d.RUNTIME)
+    d.require(os.access(SYSTEM_ZSTD, os.X_OK), '请先安装系统 zstd 命令（/usr/bin/zstd）')
+    required = size + plain_size + (1 << 20)
+    d.require(shutil.disk_usage(d.RUNTIME.parent).free >= required,
+              f'安装官方运行时需要 /opt 至少有 {(required + (1 << 20) - 1) >> 20} MiB 可用磁盘')
+    name = f'codex-app-server-{arch}-unknown-linux-musl.zst'
+    url = f'https://github.com/openai/codex/releases/download/{RUNTIME_TAG}/{name}'
+    with tempfile.TemporaryDirectory(prefix='.sub2-fingerprint-runtime-', dir=d.RUNTIME.parent) as tmp:
+        scratch = Path(tmp)
+        archive = scratch / name
+        with http(url) as src:
+            acquire(src, archive, sha, size)
+        stage = scratch / 'runtime'
+        stage.mkdir()
+        os.chmod(stage, 0o755)
+        binary = stage / d.RUNTIME_BINARY
+        expand_runtime(archive, binary, plain_size, plain_sha)
+        d.check_arch(binary)
+        new = {'inode': d.file_id(binary), 'sha256': plain_sha}
+        marker = stage / d.RUNTIME_MARKER
+        if current:
+            d.require(d.verify_runtime() == current, '下载期间运行时发生变化，已保留')
+            # Register both inodes before switching. An interrupted rename leaves a verifiable executable.
+            d.jwrite(marker, d.runtime_manifest(d.RUNTIME, [current, new]), 0o600)
+            os.replace(marker, d.RUNTIME / d.RUNTIME_MARKER)
+            d.sync_dir(d.RUNTIME)
+            os.replace(binary, d.RUNTIME / d.RUNTIME_BINARY)
+            d.sync_dir(d.RUNTIME)
+        else:
+            d.jwrite(marker, d.runtime_manifest(stage, [new]), 0o600)
+            d.vacant(d.RUNTIME)
+            os.rename(stage, d.RUNTIME)
+            d.sync_dir(d.RUNTIME.parent)
+    print('已安装并校验官方 Codex 运行时', RUNTIME_TAG, str(d.RUNTIME / d.RUNTIME_BINARY))
 
 def unpack(archive, root):
     """Only create ordinary files and directories. Permissions come from our own installer."""
@@ -346,6 +411,9 @@ def update(args):
             apply(d.BUNDLE, files, meta, folder)
         return
     d.require(meta['format'] == 2, '请在新版解压目录执行 sudo sh ./install.sh --migrate')
+    if args.install_runtime:
+        install_runtime()
+        return
     newest = None
     if not args.archive:
         newest, url, sha, size = release_info()
@@ -379,10 +447,13 @@ def main():
     modes = p.add_mutually_exclusive_group()
     modes.add_argument('--check', action='store_true')
     modes.add_argument('--recover', action='store_true')
+    modes.add_argument('--install-runtime', action='store_true', help='安装或更新本版本指定的官方 Codex 运行时')
     args = p.parse_args()
     d.require(os.geteuid() == 0, '更新需要 sudo 权限')
     d.require(args.migrate or Path(__file__).resolve().parent == d.ROOT, '请调用安装目录里的 update.sh')
     d.require(not args.migrate or not (args.archive or args.sha256), '迁移直接核对当前新版解压包')
+    d.require(not args.install_runtime or not (args.migrate or args.archive or args.sha256),
+              '--install-runtime 请单独运行')
     with d.maintenance_lock():
         update(args)
 

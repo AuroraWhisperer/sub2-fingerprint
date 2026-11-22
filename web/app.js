@@ -3,6 +3,8 @@ import { el, loadBank, renderRun, date, active } from "./results.js";
 const $ = (id) => document.getElementById(id);
 let session = {},
   bank,
+  loadingBank = false,
+  runActive = false,
   viewed = "",
   revision = 0,
   pollTimer,
@@ -148,6 +150,7 @@ function applySession() {
     viewed = "";
     lastRender = "";
     pendingSubmit = null;
+    runActive = false;
     readyAccounts = readyQuestions = false;
     for (const id of ["accounts", "questions", "result"])
       $(id).replaceChildren();
@@ -162,18 +165,21 @@ const checked = (root) =>
 function updateStart() {
   const n = checked("accounts").length,
     q = checked("questions").length;
+  const start = $("start");
+  let reason = "";
+  if (!session.logged_in) reason = "请先登录。";
+  else if (start.hasAttribute("aria-busy")) reason = "正在提交检测，请稍候。";
+  else if (runActive) reason = "本批检测正在进行，结束后即可开始下一批。";
+  else if (!readyAccounts) reason = "账号列表尚未就绪。";
+  else if (!readyQuestions) reason = "挑战题尚未就绪。";
+  else if (!n && !$("accounts").querySelector("input:not(:disabled)"))
+    reason = "当前没有可检测的账号，请刷新账号列表。";
+  else if (!n) reason = "请选择至少一个账号。";
+  else if (n > 24) reason = "每批最多可选 24 个账号。";
+  else if (!q) reason = "请选择至少一道挑战题。";
+  start.disabled = Boolean(reason);
   $("estimate").textContent =
-    n && q
-      ? `本批次最多发送 ${n * q} 次模型请求，使用所选账号的额度。`
-      : "请选择账号和至少一道挑战题。";
-  $("start").disabled =
-    !session.logged_in ||
-    !readyAccounts ||
-    !readyQuestions ||
-    !bank ||
-    !n ||
-    !q ||
-    $("start").hasAttribute("aria-busy");
+    reason || `本批次最多发送 ${n * q} 次模型请求，使用所选账号的额度。`;
 }
 function checkbox(value, checkedValue, disabled) {
   const box = el("input");
@@ -191,12 +197,12 @@ const statusNames = new Map([
   ["expired", "过期"],
 ]);
 async function accounts() {
-  const selected = new Set(checked("accounts"));
   readyAccounts = false;
   $("accountInfo").textContent = "正在读取…";
   updateStart();
   const { accounts: list } = await api("/api/accounts");
   if (!session.logged_in) return;
+  const selected = new Set(checked("accounts"));
   const rows = list.map((item) => {
     const row = el("label", null, "choice");
     const description = el("span");
@@ -240,6 +246,7 @@ async function accounts() {
 }
 async function questions() {
   readyQuestions = false;
+  updateStart();
   const { questions: list } = await api("/api/questions");
   if (!session.logged_in) return;
   const rows = list.map((item, index) => {
@@ -260,7 +267,7 @@ async function questions() {
   updateStart();
 }
 const stopPoll = () => clearTimeout(pollTimer);
-function selectRun(id) {
+function selectRun(id, alreadyActive = false) {
   if (id && !uuid.test(id)) throw new Error("任务编号异常，请刷新本次结果。");
   stopPoll();
   ++revision;
@@ -275,6 +282,8 @@ function selectRun(id) {
       "empty",
     ),
   );
+  runActive = alreadyActive;
+  updateStart();
   show("cancel", false);
   if (id) return poll(revision);
 }
@@ -284,7 +293,7 @@ async function currentRun() {
   if (!session.logged_in || revision !== version) return;
   const latest = runs[0]?.id || "";
   if (latest && viewed === latest) return poll(version);
-  return selectRun(latest);
+  return selectRun(latest, active(runs[0]?.state));
 }
 async function poll(version) {
   const runID = viewed;
@@ -308,8 +317,10 @@ async function poll(version) {
       )
         $("verify").open = true;
     }
-    show("cancel", active(run.state));
-    if (active(run.state)) pollTimer = setTimeout(() => poll(version), 3000);
+    runActive = active(run.state);
+    updateStart();
+    show("cancel", runActive);
+    if (runActive) pollTimer = setTimeout(() => poll(version), 3000);
   } catch (error) {
     if (version !== revision || sequence !== pollSequence) return;
     if (error.status === 404) {
@@ -320,36 +331,61 @@ async function poll(version) {
     }
   }
 }
+async function prepareBank() {
+  if (bank || loadingBank) return;
+  loadingBank = true;
+  $("bankMessage").textContent = "正在加载指纹库，加载完成后会自动计算概率。";
+  show("bankStatus", true);
+  show("retryBank", false);
+  try {
+    bank = await loadBank();
+  } catch (error) {
+    $("bankMessage").textContent = error.message?.includes("指纹库")
+      ? error.message : "指纹库下载失败。";
+    show("retryBank", true);
+    return;
+  } finally {
+    loadingBank = false;
+  }
+  show("bankStatus", false);
+  if (session.logged_in && lastRender)
+    renderRun($("result"), JSON.parse(lastRender), bank, session.bank_version);
+}
 async function initialize() {
   show("reconnect", false);
   session = await api("/api/session");
   applySession();
   if (!session.logged_in) return;
-  const results = await Promise.allSettled([
-    accounts(),
-    questions(),
-    loadBank().then((value) => {
-      bank = value;
-      updateStart();
-    }),
-  ]);
-  await currentRun();
+  void prepareBank();
+  const results = await Promise.allSettled([accounts(), questions(), currentRun()]);
   const failed = results.find((r) => r.status === "rejected");
   if (failed) {
     show("reconnect", true);
     throw failed.reason;
   }
 }
-async function submitRun() {
-  const payload = {
+function selection() {
+  return {
     accounts: checked("accounts").map(Number),
     questions: checked("questions"),
     parallel: Number($("parallel").value),
   };
+}
+async function submitRun() {
+  updateStart();
+  const payload = selection();
   const signature = JSON.stringify(payload);
   if (!(await syncSession())) return;
   if (payload.parallel !== Number($("parallel").value)) {
     notice("服务器并发上限已变化，请按当前选项重新开始检测。", true);
+    return;
+  }
+  if (runActive) {
+    notice("已有一批检测正在进行，结束后即可开始下一批。");
+    return;
+  }
+  if (JSON.stringify(selection()) !== signature) {
+    notice("所选账号或题目已变化，请确认后再开始检测。");
     return;
   }
   if (typeof session.epoch !== "string" || !session.epoch)
@@ -382,7 +418,7 @@ async function submitRun() {
     throw new Error("任务编号异常，请刷新本次结果确认是否已经提交。");
   pendingSubmit = null;
   notice("检测已提交。");
-  await selectRun(id);
+  await selectRun(id, true);
 }
 for (const id of ["accounts", "questions", "parallel"])
   $(id).addEventListener("change", updateStart);
@@ -428,6 +464,7 @@ action($("logout"), "click", async () => {
 });
 action($("refreshAccounts"), "click", accounts);
 action($("reloadResults"), "click", currentRun);
+action($("retryBank"), "click", prepareBank);
 action($("runForm"), "submit", submitRun);
 action($("cancel"), "click", async () => {
   await api(`/api/runs/${viewed}/cancel`, {});

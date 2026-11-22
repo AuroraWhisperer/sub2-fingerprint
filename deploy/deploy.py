@@ -17,6 +17,9 @@ from urllib.parse import urlsplit
 
 NAME = 'sub2-fingerprint'
 ROOT = Path('/opt') / NAME
+RUNTIME = ROOT.with_name(NAME + '-runtime')
+RUNTIME_BINARY = 'codex-app-server'
+RUNTIME_MARKER = 'runtime-manifest.json'
 UNIT = Path('/etc/systemd/system') / (NAME + '.service')
 SOCKET = UNIT.with_suffix('.socket')
 STATE = Path('/var/lib') / NAME
@@ -51,6 +54,34 @@ def regular(path):
 def root_owned(path, disallowed_mode=0o022):
     stat = path.stat()
     return stat.st_uid == 0 and not (stat.st_mode & disallowed_mode)
+
+def file_id(path):
+    st = path.stat()
+    return [st.st_dev, st.st_ino]
+
+def runtime_manifest(directory, executables):
+    return {'format': 1, 'owner': NAME, 'install': file_id(ROOT),
+            'directory': file_id(directory), 'executables': executables}
+
+def verify_runtime():
+    if not os.path.lexists(RUNTIME):
+        return None
+    require(RUNTIME.is_dir() and RUNTIME.resolve() == RUNTIME and root_owned(RUNTIME.parent) and
+            root_owned(RUNTIME) and not mounts_inside(RUNTIME), '运行时目录归属或挂载不符，已保留')
+    require({p.name for p in RUNTIME.iterdir()} == {RUNTIME_BINARY, RUNTIME_MARKER},
+            '运行时目录包含未知文件或缺少归属标记，已保留')
+    binary, marker = RUNTIME / RUNTIME_BINARY, RUNTIME / RUNTIME_MARKER
+    for path in (marker, binary):
+        require(regular(path) and root_owned(path) and path.stat().st_nlink == 1,
+                '运行时文件的归属或链接不符，已保留')
+    require(marker.stat().st_size < 4096, '运行时归属标记无效')
+    meta = json.loads(marker.read_text('utf-8'))
+    records = meta.get('executables') if isinstance(meta, dict) else None
+    require(isinstance(records, list) and 1 <= len(records) <= 2 and meta == runtime_manifest(RUNTIME, records),
+            '运行时目录与本次安装不匹配，已保留')
+    current = {'inode': file_id(binary), 'sha256': digest(binary)}
+    require(current in records, '运行时程序的身份或内容已更改，已保留')
+    return current
 
 def safe_base(value):
     require(value and not any(c.isspace() or ord(c) < 32 for c in value), 'Sub2 地址无效')
@@ -313,12 +344,18 @@ def uninstall(opts):
     meta = verify_manifest()
     require(meta['format'] == 2, '旧安装请使用原版本自带的卸载器')
     check_state_contents()
+    runtime = verify_runtime()
     if opts.check:
-        print('已核对目录、账号及两个 systemd 单元。')
+        print('已核对目录、可选运行时、账号及两个 systemd 单元。')
         return
     run('systemctl', 'disable', '--now', SOCKET.name)
     run('systemctl', 'stop', UNIT.name)
     verify_manifest()
+    require(verify_runtime() == runtime, '运行时在卸载期间发生变化，已保留')
+    if runtime:
+        (RUNTIME / RUNTIME_BINARY).unlink()
+        (RUNTIME / RUNTIME_MARKER).unlink()
+        RUNTIME.rmdir()
     remove_state(meta['state'], meta['uid'], meta['gid'])
     SOCKET.unlink()
     UNIT.unlink()
