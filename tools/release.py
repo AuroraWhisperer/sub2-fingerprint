@@ -1,4 +1,4 @@
-"""Build default Linux release archives with a clean, explicit file list."""
+"""Build reproducible Linux server and Windows launcher packages."""
 import argparse
 import gzip
 import hashlib
@@ -9,6 +9,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_FILES = ('deploy.py','update.py','install.sh','uninstall.sh','update.sh',
@@ -52,6 +53,22 @@ def main():
             content['SHA256SUMS']=''.join(sha(data)+'  '+name+'\n' for name,data in sorted(content.items())).encode()
             artifact=out/f'sub2-fingerprint-linux-{arch}.tar.gz'; make_archive(artifact,content)
             checks.append(sha(artifact.read_bytes())+'  '+artifact.name+'\n')
+        env = dict(os.environ, GOOS='windows', GOARCH='amd64', CGO_ENABLED='0', GOTOOLCHAIN='local')
+        launcher = Path(scratch) / 'Sub2-Fingerprint.exe'
+        subprocess.run([args.go, 'build', '-trimpath', '-buildvcs=false',
+                        '-ldflags=-s -w -buildid= -H=windowsgui', '-o', str(launcher), './cmd/detector-launcher'],
+                       cwd=ROOT, env=env, check=True)
+        artifact = out / 'sub2-fingerprint-windows-amd64.zip'
+        members = {launcher.name: launcher.read_bytes(), 'launcher.example.json': (ROOT/'launcher.example.json').read_bytes(),
+                   'README.md': (ROOT/'README.md').read_bytes(), 'VERSION': files['VERSION'],
+                   'LICENSES/Go.txt': files['LICENSES/Go.txt'], 'LICENSES/Go-PATENTS.txt': files['LICENSES/Go-PATENTS.txt']}
+        with zipfile.ZipFile(artifact, 'w') as archive:
+            for name, data in sorted(members.items()):
+                entry = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+                entry.create_system = 3
+                entry.external_attr = 0o100644 << 16
+                archive.writestr(entry, data, compress_type=zipfile.ZIP_STORED)
+        checks.append(sha(artifact.read_bytes())+'  '+artifact.name+'\n')
     (out/'SHA256SUMS.txt').write_bytes(''.join(checks).encode())
     print('Built',version,'in',out)
 

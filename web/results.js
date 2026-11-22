@@ -52,7 +52,8 @@ export function scoreAccount(rows, questions, bank) {
   }
 }
 
-export function accountReports(rows, questions, bank) {
+export function accountReports(rows, questions, bank, state = "done") {
+  const canScore = bank && !active(state);
   const groups = new Map();
   for (const row of rows) {
     if (!groups.has(row.account_id)) groups.set(row.account_id, []);
@@ -61,7 +62,7 @@ export function accountReports(rows, questions, bank) {
   return Array.from(groups, ([id, answers]) => ({
     id,
     rows: answers,
-    result: bank ? scoreAccount(answers, questions, bank) : null,
+    result: canScore ? scoreAccount(answers, questions, bank) : null,
   }));
 }
 
@@ -79,6 +80,7 @@ function details(title, key) {
 }
 const labels = {
   queued: "排队中",
+  waiting_capacity: "等待账号空位",
   running: "检测中",
   done: "已完成",
   failed: "失败",
@@ -86,7 +88,8 @@ const labels = {
   interrupted: "已中断",
 };
 export const label = (state) => labels[state] || state || "未知";
-export const active = (state) => state === "running" || state === "queued";
+export const active = (state) =>
+  state === "running" || state === "queued" || state === "waiting_capacity";
 export function date(value) {
   if (!value || String(value).startsWith("0001-01-01")) return "";
   const time = new Date(value);
@@ -112,16 +115,10 @@ function probabilityList(score, key) {
   group.append(list);
   return group;
 }
-function appendScore(section, result, total, pending) {
+function appendScore(section, result, total) {
   const score = result?.score;
   if (!score) {
-    section.append(
-      el(
-        "p",
-        pending ? "等待有效答案。" : "没有可用于归因的有效答案。",
-        "small",
-      ),
-    );
+    section.append(el("p", "没有可用于归因的有效答案。", "small"));
     return;
   }
   const line = el("div", null, "metrics");
@@ -138,27 +135,26 @@ function appendScore(section, result, total, pending) {
   }
   section.append(
     line,
-    el(
-      "p",
-      `${pending ? "当前" : "本次"}计入 ${score.used_outputs}/${total} 道题。`,
-      "small",
-    ),
+    el("p", `本次计入 ${score.used_outputs}/${total} 道题。`, "small"),
   );
 }
-function answer(row, question, index, accepted) {
+function answer(row, question, accepted) {
   const node = details(
-    `挑战 ${index} · ${label(row.status)}${accepted === false ? " · 输出无效" : ""}`,
+    `挑战 ${question?.number ?? "?"} · ${label(row.status)}${accepted === false ? " · 输出无效" : ""}`,
     `r-${row.account_id}-${row.question_id}`,
   );
   node.classList.add("answer");
-  if (row.error) node.append(el("p", row.error, "small warning"));
+  if (row.error) {
+    const diagnostic = row.code ? `${row.error} · ${row.code}` : row.error;
+    node.append(el("p", diagnostic, "small warning"));
+  }
   if (row.model) node.append(el("p", `上游返回标签：${row.model}`, "small"));
   const timing = [date(row.started), date(row.ended)]
     .filter(Boolean)
     .join(" — ");
   if (timing) node.append(el("p", timing, "small"));
   if (row.request_id)
-    node.append(el("p", `请求编号：${row.request_id}`, "small"));
+    node.append(el("p", `检测编号 ${row.request_id}`, "small"));
   if (question) node.append(el("h4", "题目"), el("pre", question.prompt));
   if (row.text) node.append(el("h4", "原始答案"), el("pre", row.text));
   return node;
@@ -170,20 +166,20 @@ export function renderRun(container, run, bank, bankVersion) {
       (item) => item.dataset.detail,
     ),
   );
-  const questions = new Map(
-    run.questions.map((q, i) => [q.id, { ...q, index: i + 1 }]),
-  );
+  const questions = new Map(run.questions.map((q) => [q.id, q]));
   const out = document.createDocumentFragment();
   const complete = run.rows.filter((row) => !active(row.status)).length;
   const summary = el("div", null, "summary");
   summary.append(
-    el("h3", label(run.state)),
+    el("h3", run.state === "done" && run.rows.every((row) => row.status === "failed")
+      ? "本次检测失败" : label(run.state)),
     el("span", `已结束 ${complete}/${run.rows.length} 个请求`, "small"),
   );
   out.append(summary);
   const compatible = Boolean(
     run.bank_version && run.bank_version === bankVersion && bank,
   );
+  const pending = active(run.state);
   if (!compatible)
     out.append(
       el(
@@ -192,25 +188,22 @@ export function renderRun(container, run, bank, bankVersion) {
         "warning",
       ),
     );
+  else if (pending)
+    out.append(el("p", "本批检测结束后计算各账号的归因概率。", "small"));
   for (const { id, rows, result } of accountReports(
     run.rows,
     questions,
     compatible ? bank : null,
+    run.state,
   )) {
     const section = el("article", null, "account-result");
     section.append(el("h3", `${rows[0].name || "账号"} · #${id}`));
-    if (compatible)
-      appendScore(
-        section,
-        result,
-        rows.length,
-        rows.some((row) => active(row.status)),
-      );
+    if (compatible && !pending) appendScore(section, result, rows.length);
     if (result?.score) section.append(probabilityList(result.score, `p-${id}`));
     for (const row of rows) {
       const q = questions.get(row.question_id);
       section.append(
-        answer(row, q, q?.index || "?", result?.accepted.get(row.question_id)),
+        answer(row, q, result?.accepted.get(row.question_id)),
       );
     }
     out.append(section);

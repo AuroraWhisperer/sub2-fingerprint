@@ -62,7 +62,7 @@ func TestAdapterSelectedAccountAndIndependentAnswers(t *testing.T) {
 			return
 		}
 		details.Add(1)
-		mockOK(w, map[string]any{"id": id, "name": "duplicate", "status": "active", "schedulable": true, "current_concurrency": 0, "platform": "openai", "type": "oauth", "credentials": map[string]any{"chatgpt_account_id": "identity-" + accountID}})
+		mockOK(w, map[string]any{"id": id, "name": "duplicate", "status": "active", "schedulable": true, "current_concurrency": 1, "concurrency": 20, "platform": "openai", "type": "oauth", "credentials": map[string]any{"chatgpt_account_id": "identity-" + accountID}})
 	}))
 	defer admin.Close()
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +133,7 @@ func TestAdapterStopsBeforeUpstream(t *testing.T) {
 		expiry       int64
 		code         string
 	}{
-		{"busy", "active", 1, 1, 9999999999, "ACCOUNT_UNAVAILABLE"}, {"disabled", "disabled", 0, 1, 9999999999, "ACCOUNT_UNAVAILABLE"}, {"ambiguous export", "active", 0, 2, 9999999999, "ACCOUNT_MISMATCH"}, {"expired access token", "active", 0, 1, 1, "UPSTREAM_TOKEN"},
+		{"full", "active", 1, 1, 9999999999, "ACCOUNT_FULL"}, {"disabled", "disabled", 0, 1, 9999999999, "ACCOUNT_UNAVAILABLE"}, {"ambiguous export", "active", 0, 2, 9999999999, "ACCOUNT_MISMATCH"}, {"expired access token", "active", 0, 1, 1, "UPSTREAM_TOKEN"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var exports int
@@ -147,7 +147,7 @@ func TestAdapterStopsBeforeUpstream(t *testing.T) {
 					mockOK(w, map[string]any{"accounts": accs})
 					return
 				}
-				mockOK(w, map[string]any{"id": 1, "name": "test", "platform": "openai", "type": "oauth", "schedulable": true, "current_concurrency": test.busy, "status": test.status})
+				mockOK(w, map[string]any{"id": 1, "name": "test", "platform": "openai", "type": "oauth", "schedulable": true, "current_concurrency": test.busy, "concurrency": 1, "status": test.status})
 			}))
 			defer panel.Close()
 			a, _ := NewAdapter(panel.URL)
@@ -156,7 +156,7 @@ func TestAdapterStopsBeforeUpstream(t *testing.T) {
 			a.upstream = target.URL
 			_, err := a.Probe(context.Background(), "jwt", 1, "probe")
 			assertGate(t, err, test.code)
-			if test.code == "ACCOUNT_UNAVAILABLE" && exports != 0 {
+			if (test.code == "ACCOUNT_UNAVAILABLE" || test.code == "ACCOUNT_FULL") && exports != 0 {
 				t.Error("ineligible account exported")
 			}
 		})
@@ -189,7 +189,7 @@ func TestAdapterAuthorizationContracts(t *testing.T) {
 			}
 			mockOK(w, map[string]any{"verified": true})
 		case "/api/v1/admin/accounts":
-			mockOK(w, map[string]any{"page": 1, "pages": 1, "items": []any{map[string]any{"id": 1, "name": "acct", "platform": "openai", "type": "oauth", "status": "active", "schedulable": true, "current_concurrency": 0, "credentials": map[string]any{"refresh_token": "sensitive", "access_token": "sensitive"}}}})
+			mockOK(w, map[string]any{"page": 1, "pages": 1, "items": []any{map[string]any{"id": 1, "name": "acct", "platform": "openai", "type": "oauth", "status": "active", "schedulable": true, "current_concurrency": 0, "concurrency": 20, "credentials": map[string]any{"refresh_token": "sensitive", "access_token": "sensitive"}}}})
 		case "/api/v1/auth/logout":
 			loggedOut = p["refresh_token"] == "refresh"
 			mockOK(w, map[string]any{})
@@ -281,7 +281,7 @@ func TestAdapterHonorsClientPolicyAndProxyExpiry(t *testing.T) {
 				mockOK(w, map[string]any{"accounts": []any{map[string]any{"name": "A", "type": "oauth", "platform": "openai", "extra": map[string]bool{"codex_cli_only": true}}}})
 				return
 			}
-			mockOK(w, map[string]any{"id": 1, "name": "A", "type": "oauth", "platform": "openai", "status": "active", "schedulable": true, "current_concurrency": 0, "extra": map[string]bool{"codex_cli_only": !changeBeforeExport}})
+			mockOK(w, map[string]any{"id": 1, "name": "A", "type": "oauth", "platform": "openai", "status": "active", "schedulable": true, "current_concurrency": 0, "concurrency": 20, "extra": map[string]bool{"codex_cli_only": !changeBeforeExport}})
 		}))
 		a, _ := NewAdapter(panel.URL)
 		a.upstream = "http://invalid.invalid"
@@ -404,5 +404,28 @@ func TestAdapterSessionFailures(t *testing.T) {
 				t.Fatal("remote error text leaked")
 			}
 		})
+	}
+}
+
+func TestAdminBadRequestShowsStageWithoutEchoingPrivateDetails(t *testing.T) {
+	panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"code":400,"reason":"fixture-private-information","message":"fixture-private-information"}`)
+	}))
+	defer panel.Close()
+	a, err := NewAdapter(panel.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ path, code string }{
+		{"/admin/accounts?page=1", "ADMIN_LIST_BAD_REQUEST"},
+		{"/admin/accounts/17", "ADMIN_DETAIL_BAD_REQUEST"},
+		{"/admin/accounts/data?ids=17&include_proxies=true", "ADMIN_EXPORT_BAD_REQUEST"},
+	} {
+		err := a.call(context.Background(), http.MethodGet, tc.path, "fixture", nil, nil)
+		assertGate(t, err, tc.code)
+		if strings.Contains(err.Error(), "fixture-private-information") || !strings.Contains(err.Error(), "HTTP 400") {
+			t.Fatal("admin diagnostics lost the HTTP status or exposed remote content", tc.code)
+		}
 	}
 }

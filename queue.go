@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -30,6 +32,7 @@ func nowStamp() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 type Question struct {
 	ID       string `json:"id"`
+	Number   int    `json:"number"`
 	Prompt   string `json:"prompt"`
 	Expected int    `json:"expected_count"`
 }
@@ -83,7 +86,7 @@ type queue struct {
 	probe    probeFunc
 }
 
-func nonterminal(s string) bool { return s == "queued" || s == "running" }
+func nonterminal(s string) bool { return s == "queued" || s == "waiting_capacity" || s == "running" }
 func openQueue(_ string, version string, probe probeFunc) (*queue, error) {
 	return &queue{version: version, probe: probe, seen: make(map[string]struct{})}, nil
 }
@@ -200,13 +203,16 @@ func (q *queue) start(parent context.Context, owner int64, jwt string, req RunRe
 		return errors.New("检测规模无效")
 	}
 	r := &ownedRun{owner: owner, epoch: req.Epoch, Run: Run{Summary: Summary{req.ID, nowStamp(), "queued"}, BankVersion: q.version, Parallel: req.Parallel, Questions: append([]Question(nil), qs...)}}
+	batchCode := "T" + strings.ReplaceAll(req.ID, "-", "")
 	for _, id := range req.Accounts {
 		a, ok := accounts[id]
 		if !ok {
 			return errors.New("账号列表已变化，请刷新后再提交")
 		}
 		for _, question := range qs {
-			r.Rows = append(r.Rows, Row{AccountID: id, Name: a.Name, QuestionID: question.ID, Status: "queued"})
+			// Assign the code before scheduling so queued and skipped challenges keep their identity.
+			code := batchCode + "R" + strconv.Itoa(len(r.Rows)+1)
+			r.Rows = append(r.Rows, Row{AccountID: id, Name: a.Name, QuestionID: question.ID, RequestID: code, Status: "queued"})
 		}
 	}
 	ctx, cancel := context.WithCancel(parent)
@@ -218,32 +224,50 @@ func (q *queue) start(parent context.Context, owner int64, jwt string, req RunRe
 	go q.execute(ctx, jwt, r)
 	return nil
 }
+
+// A full Sub2API account yields its local worker position while it waits.
+type accountSlot struct {
+	pool chan struct{}
+	held bool
+}
+
+func (s *accountSlot) acquire(ctx context.Context) bool {
+	select {
+	case s.pool <- struct{}{}:
+		s.held = true
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *accountSlot) release() {
+	if s.held {
+		<-s.pool
+		s.held = false
+	}
+}
+
 func (q *queue) execute(ctx context.Context, jwt string, r *ownedRun) {
 	defer q.wg.Done()
-	jobs := make(chan int)
+	slots := make(chan struct{}, r.Parallel)
 	var workers sync.WaitGroup
-	for w := 0; w < r.Parallel; w++ {
+	for a := 0; a < len(r.Rows)/len(r.Questions); a++ {
+		slot := &accountSlot{pool: slots}
+		if !slot.acquire(ctx) {
+			break
+		}
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for a := range jobs {
-				for k, question := range r.Questions {
-					if !q.doRow(ctx, jwt, r, a*len(r.Questions)+k, question) {
-						break
-					}
+			defer slot.release()
+			for k, question := range r.Questions {
+				if !q.doRow(ctx, jwt, r, a*len(r.Questions)+k, question, slot) {
+					break
 				}
 			}
 		}()
 	}
-send:
-	for a := 0; a < len(r.Rows)/len(r.Questions); a++ {
-		select {
-		case jobs <- a:
-		case <-ctx.Done():
-			break send
-		}
-	}
-	close(jobs)
 	workers.Wait()
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -257,7 +281,7 @@ send:
 	q.cancel()
 	q.cancel = nil
 }
-func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, question Question) bool {
+func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, question Question, slot *accountSlot) bool {
 	q.mu.Lock()
 	if ctx.Err() != nil {
 		q.mu.Unlock()
@@ -266,13 +290,9 @@ func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, quest
 	row := &r.Rows[i]
 	row.Status = "running"
 	row.Started = nowStamp()
-	row.RequestID = randomID()
 	r.State = "running"
 	q.mu.Unlock()
-	deadline, cancel := context.WithTimeout(ctx, 120*time.Second)
-	answer, err := q.probe(deadline, jwt, row.AccountID, question.Prompt)
-	expired := errors.Is(deadline.Err(), context.DeadlineExceeded)
-	cancel()
+	answer, err := q.probeWhenReady(ctx, jwt, row, question, slot)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	row.Ended = nowStamp()
@@ -282,7 +302,7 @@ func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, quest
 		if q.stopping {
 			row.Status = "interrupted"
 		}
-	case expired:
+	case errors.Is(err, context.DeadlineExceeded):
 		row.Status = "failed"
 		row.Code = "TIMEOUT"
 		row.Error = "单题已超时"
@@ -315,9 +335,50 @@ func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, quest
 	return ctx.Err() == nil
 }
 
+const capacityPollInterval = 5 * time.Second
+const capacityWaitLimit = 5 * time.Minute
+
+var errCapacityTimeout = gate("CAPACITY_TIMEOUT", "等待账号空位已达 5 分钟，本题未发送")
+
+func (q *queue) probeWhenReady(ctx context.Context, jwt string, row *Row, question Question, slot *accountSlot) (ProbeAnswer, error) {
+	var waitCtx context.Context
+	for {
+		deadline, cancel := context.WithTimeout(ctx, 120*time.Second)
+		answer, err := q.probe(deadline, jwt, row.AccountID, question.Prompt)
+		if deadline.Err() != nil {
+			err = deadline.Err()
+		}
+		cancel()
+		if err != errAccountFull {
+			return answer, err
+		}
+		// This sentinel is returned before credentials are exported or any prompt is sent.
+		if waitCtx == nil {
+			var stopWaiting context.CancelFunc
+			waitCtx, stopWaiting = context.WithTimeout(ctx, capacityWaitLimit)
+			defer stopWaiting()
+		}
+		q.mu.Lock()
+		row.Status = "waiting_capacity"
+		q.mu.Unlock()
+		slot.release()
+		select {
+		case <-waitCtx.Done():
+			return ProbeAnswer{}, errCapacityTimeout
+		case <-time.After(capacityPollInterval):
+		}
+		if !slot.acquire(waitCtx) || waitCtx.Err() != nil {
+			return ProbeAnswer{}, errCapacityTimeout
+		}
+		q.mu.Lock()
+		row.Status = "running"
+		q.mu.Unlock()
+	}
+}
+
 func stopsAccount(code string) bool {
 	switch code {
-	case "", "TIMEOUT", "UPSTREAM_REFUSAL", "UPSTREAM_INCOMPLETE", "UPSTREAM_SIZE", "UPSTREAM_FORMAT":
+	case "", "TIMEOUT", "UPSTREAM_REFUSAL", "UPSTREAM_INCOMPLETE", "UPSTREAM_SIZE", "UPSTREAM_FORMAT", "UPSTREAM_INPUT":
 		return false
 	default:
 		return true

@@ -20,6 +20,7 @@ jobs:
           cache: false
       - run: node --test tools/scoring.test.mjs
       - run: go vet ./... && go test -race ./...
+      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./cmd/detector-launcher
       - run: python3 -m unittest discover -s deploy/tests -p 'test_*.py'
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
@@ -41,4 +42,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --notes-file RELEASE.md dist/*.tar.gz dist/SHA256SUMS.txt
+        run: gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --notes-file RELEASE.md dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt

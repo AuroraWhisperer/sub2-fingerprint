@@ -87,11 +87,13 @@ func newApp(cfg settings, api sub2) (*app, error) {
 		if len(g) != 3 {
 			return nil, errors.New("invalid challenge group")
 		}
-		for _, q := range g {
+		for i := range g {
+			q := &g[i]
 			if q.ID == "" || a.questions[q.ID].ID != "" || q.Expected < 292 || q.Expected > 332 || q.Prompt == "" {
 				return nil, errors.New("invalid challenge")
 			}
-			a.questions[q.ID] = q
+			q.Number = i + 1
+			a.questions[q.ID] = *q
 		}
 	}
 	bank, e := assets.ReadFile("web/unified_bank.json")

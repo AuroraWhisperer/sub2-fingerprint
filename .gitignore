@@ -8,3 +8,4 @@
 *.exe
 *.test
 __pycache__/
+/launcher.local.json

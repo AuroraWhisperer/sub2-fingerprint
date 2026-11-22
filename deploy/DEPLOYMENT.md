@@ -1,10 +1,10 @@
 # 私人账号指纹检测器 · 安装、迁移与卸载
 
-v0.2.0 由 systemd 在服务器的 127.0.0.1:17861 上等待连接。打开检测页才启动 Go 进程。最后一次访问约两分钟后，如果已经没有正在处理的批次，进程会退出，下一次访问会自动启动。每个批次的答案和归因只在本次使用中展示。检测请求会消耗所选上游账号的额度。
+从 v0.2.0 起，检测器由 systemd 在服务器的 127.0.0.1:17861 上等待连接。打开检测页才启动 Go 进程。最后一次访问约两分钟后，如果已经没有正在处理的批次，进程会退出，下一次访问会自动启动。每个批次的答案和归因只在本次使用中展示。检测请求会消耗所选上游账号的额度。
 
 ## 从 v0.1.0 迁移
 
-先等正在运行的检测结束，关闭检测页。下载对应 CPU 架构的 v0.2.0 正式发布包和同一发布页的 SHA256SUMS.txt，核对整包 SHA-256 后，在只有自己可写的临时目录解压。在解压目录运行以下命令。第一行检查现有安装、端口与资源归属。第二行切换监听方式，验证新版后删除旧版保存在服务器的检测记录。迁移不会生成记录备份。软件发布页位于 [GitHub Releases](https://github.com/AuroraWhisperer/sub2-fingerprint/releases)。
+先等正在运行的检测结束，关闭检测页。下载对应 CPU 架构的最新正式发布包和同一发布页的 SHA256SUMS.txt，核对整包 SHA-256 后，在只有自己可写的临时目录解压。在解压目录运行以下命令。第一行检查现有安装、端口与资源归属。第二行切换监听方式，验证新版后删除旧版保存在服务器的检测记录。迁移不会生成记录备份。软件发布页位于 [GitHub Releases](https://github.com/AuroraWhisperer/sub2-fingerprint/releases)。
 
 ```sh
 sudo sh ./install.sh --migrate --check
@@ -30,15 +30,13 @@ sudo sh ./install.sh --sub2-url "$SUB2_URL"
 
 ## 打开与验收
 
-在 Windows PowerShell 使用已核验 SSH 主机密钥的个人 SSH 目标。脚本支持 `-SshPort`。Windows 的 TCP 查询功能可用时，脚本只在本机观察转发连接，连续五分钟未见连接就关闭本次 SSH 隧道。再次使用时重新打开脚本。也可直接运行后一条命令，使用完成后在前台按 Ctrl+C 关闭隧道。
+Windows 用户解压本次发布的 `sub2-fingerprint-windows-amd64.zip`。在 `launcher.local.json` 里填入自己的 SSH 别名，格式见同目录的 `launcher.example.json`。双击 `Sub2-Fingerprint.exe`。请事先用 Windows OpenSSH 正常连接过该别名并核验主机密钥。启动器建立私人回环隧道，检查服务就绪后打开默认浏览器，空闲约五分钟后自动释放隧道。需要手动连接时，可在任意有 OpenSSH 的个人电脑上运行以下命令。
 
-```powershell
-.\Open-Detector.ps1 -SshTarget my-server
-# 或者
+```sh
 ssh -N -T -a -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -L 127.0.0.1:17861:127.0.0.1:17861 my-server
 ```
 
-访问 `http://127.0.0.1:17861/`，先选一个空闲账号和一道题。测试时可查看 `free -m` 和已有业务响应。每批检测默认一次测 1 个账号。新安装最多可同时测 3 个不同账号，同一账号的题目依次执行。服务器配置 `/opt/sub2-fingerprint/config/config.json` 中的 `parallel` 控制这个上限。升级会保留原有的 1 或 2。如果需要调整，可将 `parallel` 设为 1、2 或 3，待当前批次结束后停止检测服务，下次打开页面时生效。512 MB 主机应以实际 MemAvailable、交换和延迟为准。工作进程限制为 MemoryHigh=64M、MemoryMax=96M 和 CPUQuota=20%。
+访问 `http://127.0.0.1:17861/`，先选一个有可用容量的账号和一道题。测试时可查看 `free -m` 和已有业务响应。每批检测默认一次测 1 个账号。新安装最多可同时测 3 个不同账号，同一账号的题目依次执行。服务器配置 `/opt/sub2-fingerprint/config/config.json` 中的 `parallel` 控制这个上限。升级会保留原有的 1 或 2。如果需要调整，可将 `parallel` 设为 1、2 或 3，待当前批次结束并让检测器自然退出，下次启动时生效。512 MB 主机应以实际 MemAvailable、交换和延迟为准。工作进程限制为 MemoryHigh=64M、MemoryMax=96M 和 CPUQuota=20%。
 
 ```sh
 systemctl is-active sub2-fingerprint.socket

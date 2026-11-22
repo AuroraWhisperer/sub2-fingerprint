@@ -46,6 +46,8 @@ type AccountView struct {
 	Status   string `json:"status"`
 	Reason   string `json:"reason"`
 	Eligible bool   `json:"eligible"`
+	Used     *int   `json:"current_concurrency,omitempty"`
+	Limit    *int   `json:"concurrency,omitempty"`
 }
 type ProbeAnswer struct {
 	Text      string `json:"text"`
@@ -94,7 +96,7 @@ func httpFailure(ctx context.Context, err error, side string) error {
 }
 
 // Translate only known reasons. Remote messages, URLs and body excerpts may carry secrets.
-func adminFailure(status int, reason string) error {
+func adminFailure(status int, reason, path string) error {
 	switch reason {
 	case "STEP_UP_REQUIRED":
 		return gate(reason, "本次读取需要 Sub2API 二次验证")
@@ -106,6 +108,16 @@ func adminFailure(status int, reason string) error {
 		return gate("FORBIDDEN", "请使用管理员登录会话进行二次验证")
 	case "CAPTCHA_REQUIRED", "CAPTCHA_INVALID", "CAPTCHA_VERIFICATION_FAILED", "TURNSTILE_VERIFICATION_FAILED":
 		return gate("CAPTCHA_REQUIRED", "Sub2API 要求额外的人机验证，请使用受支持的正常登录方式")
+	}
+	if status == http.StatusBadRequest {
+		switch {
+		case strings.HasPrefix(path, "/admin/accounts/data?"):
+			return gate("ADMIN_EXPORT_BAD_REQUEST", "Sub2API 在读取所选账号资料时返回 HTTP 400，尚未向模型发题")
+		case strings.HasPrefix(path, "/admin/accounts/"):
+			return gate("ADMIN_DETAIL_BAD_REQUEST", "Sub2API 在核对账号状态时返回 HTTP 400，尚未向模型发题")
+		case strings.HasPrefix(path, "/admin/accounts?"):
+			return gate("ADMIN_LIST_BAD_REQUEST", "Sub2API 在读取账号列表时返回 HTTP 400，请刷新列表")
+		}
 	}
 	switch status {
 	case 401:
@@ -160,7 +172,7 @@ func (a *Adapter) call(ctx context.Context, method, path, jwt string, payload, d
 		if path == "/auth/refresh" || path == "/auth/me" {
 			return sessionHTTPFailure(resp.StatusCode, details.Reason, string(details.Code), details.Message)
 		}
-		return adminFailure(resp.StatusCode, details.Reason)
+		return adminFailure(resp.StatusCode, details.Reason, path)
 	}
 	// Decode into typed structs so refresh_token and arbitrary exported fields never enter application objects.
 	var envelope struct {
@@ -179,7 +191,7 @@ func (a *Adapter) call(ctx context.Context, method, path, jwt string, payload, d
 		return gate("ADMIN_FORMAT", "Sub2API 响应格式或大小异常")
 	}
 	if *envelope.Code != 0 {
-		return adminFailure(resp.StatusCode, envelope.Reason)
+		return adminFailure(resp.StatusCode, envelope.Reason, path)
 	}
 	return nil
 }
@@ -351,6 +363,7 @@ type accountData struct {
 	Status      string         `json:"status"`
 	Schedulable *bool          `json:"schedulable"`
 	Busy        *int           `json:"current_concurrency"`
+	Limit       *int           `json:"concurrency"`
 	Parent      *int64         `json:"parent_account_id"`
 	Expires     *int64         `json:"expires_at"`
 	Limited     *time.Time     `json:"rate_limit_reset_at"`
@@ -372,6 +385,10 @@ func ordinaryOAuth(c credentialData) bool {
 	}
 	return true
 }
+
+// Only the pre-export capacity check may return this sentinel. It is safe to retry.
+var errAccountFull = gate("ACCOUNT_FULL", "账号并发已满，等待空位")
+
 func (r accountData) eligibility(now time.Time) string {
 	switch {
 	case r.ID <= 0 || r.Platform != "openai" || r.Type != "oauth" || r.Parent != nil || !ordinaryOAuth(r.Cred):
@@ -380,7 +397,7 @@ func (r accountData) eligibility(now time.Time) string {
 		return "账号设置为仅允许 Codex 官方客户端"
 	case r.Status != "active":
 		return "Sub2API 账号未处于正常状态"
-	case r.Schedulable == nil || r.Busy == nil || *r.Busy < 0:
+	case r.Schedulable == nil || r.Busy == nil || *r.Busy < 0 || r.Limit == nil:
 		return "Sub2API 运行状态字段不完整"
 	case !*r.Schedulable:
 		return "Sub2API 已暂停调度"
@@ -388,8 +405,6 @@ func (r accountData) eligibility(now time.Time) string {
 		return "Sub2API 账号已到期"
 	case (r.Limited != nil && r.Limited.After(now)) || (r.Overload != nil && r.Overload.After(now)) || (r.TempPause != nil && r.TempPause.After(now)):
 		return "Sub2API 标记账号限流或冷却中"
-	case *r.Busy > 0:
-		return "账号有正在进行的请求，请稍后重试"
 	}
 	return ""
 }
@@ -415,7 +430,7 @@ func (a *Adapter) List(ctx context.Context, jwt string) ([]AccountView, error) {
 			}
 			seen[row.ID] = true
 			reason := row.eligibility(time.Now())
-			accounts = append(accounts, AccountView{ID: row.ID, Name: row.Name, Status: row.Status, Reason: reason, Eligible: reason == ""})
+			accounts = append(accounts, AccountView{ID: row.ID, Name: row.Name, Status: row.Status, Reason: reason, Eligible: reason == "", Used: row.Busy, Limit: row.Limit})
 		}
 		if page >= r.Pages {
 			return accounts, nil
@@ -586,7 +601,7 @@ func requestHeaders(detail accountData, cred credentialData, now time.Time) (htt
 	// Use the account-configured identity when present. Label this integration in the default protocol UA.
 	ua := cred.UA
 	if ua == "" {
-		ua = "sub2-fingerprint/0.1.0"
+		ua = "sub2-fingerprint/" + strings.TrimPrefix(strings.TrimSpace(releaseVersion), "v")
 	}
 	m := clientUA.FindStringSubmatch(ua)
 	if len(m) != 3 || len(ua) > 512 || !headerValue.MatchString(ua) {
@@ -616,6 +631,9 @@ func (a *Adapter) Probe(ctx context.Context, jwt string, id int64, prompt string
 	if reason := row.eligibility(time.Now()); reason != "" {
 		return empty, gate("ACCOUNT_UNAVAILABLE", reason)
 	}
+	if *row.Limit > 0 && *row.Busy >= *row.Limit {
+		return empty, errAccountFull
+	}
 	var data exportData
 	// A missing or empty ids parameter would export all accounts. Construct it from the verified positive ID only.
 	if err := a.call(ctx, "GET", "/admin/accounts/data?ids="+rawID+"&include_proxies=true", jwt, nil, &data); err != nil {
@@ -635,7 +653,13 @@ func (a *Adapter) Probe(ctx context.Context, jwt string, id int64, prompt string
 	if err != nil {
 		return empty, err
 	}
-	wire := map[string]any{"model": probeModel, "reasoning": map[string]string{"effort": "low"}, "instructions": "Answer the user’s numerical challenge directly. Do not use tools.", "input": []any{map[string]any{"role": "user", "content": []any{map[string]string{"type": "input_text", "text": prompt}}}}, "stream": true, "store": false, "tools": []any{}}
+	wire := map[string]any{
+		"model": probeModel, "reasoning": map[string]string{"effort": "low"},
+		"include":      []string{"reasoning.encrypted_content"},
+		"instructions": "Answer the user’s numerical challenge directly. Do not use tools.",
+		"input":        []any{map[string]any{"role": "user", "content": []any{map[string]string{"type": "input_text", "text": prompt}}}},
+		"stream":       true, "store": false,
+	}
 	body, err := json.Marshal(wire)
 	if err != nil {
 		return empty, gate("INVALID", "题目无法编码")
@@ -668,6 +692,8 @@ func (a *Adapter) Probe(ctx context.Context, jwt string, id int64, prompt string
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case 200:
+	case http.StatusBadRequest:
+		return empty, upstreamBadRequest(resp)
 	case 401:
 		return empty, gate("UPSTREAM_TOKEN", "上游拒绝账号凭据，请在 Sub2API 核对后重试")
 	case 403:
@@ -692,12 +718,94 @@ func (a *Adapter) Probe(ctx context.Context, jwt string, id int64, prompt string
 	return result, nil
 }
 
+// Provider messages sometimes echo input or credentials. Classify them locally and
+// return only our own labels plus explicitly recognised protocol parameters.
+type providerProblem struct {
+	Code    string `json:"code"`
+	Param   string `json:"param"`
+	Message string `json:"message"`
+}
+
+func (p providerProblem) diagnostic(source string) *GateError {
+	model := func() *GateError {
+		return gate("UPSTREAM_MODEL", source+"指出模型不可用或模型参数有误，请核对该账号能否使用 "+probeModel)
+	}
+	effort := func() *GateError {
+		return gate("UPSTREAM_REASONING", source+"指出推理参数有误，请核对该账号能否使用 low 档位")
+	}
+	client := func() *GateError {
+		return gate("UPSTREAM_CLIENT", source+"拒绝当前客户端或版本，请核对该账号允许的客户端")
+	}
+	switch p.Param {
+	case "reasoning.effort", "reasoning":
+		return effort()
+	case "model":
+		return model()
+	case "input", "instructions", "store", "stream", "tools", "include", "tool_choice":
+		return gate("UPSTREAM_PARAMETER", source+"指出请求参数 "+p.Param+" 有误")
+	}
+	switch p.Code {
+	case "model_not_found", "unsupported_model", "model_not_supported":
+		return model()
+	case "unsupported_client", "unsupported_client_version", "client_version_outdated":
+		return client()
+	case "context_length_exceeded":
+		return gate("UPSTREAM_INPUT", source+"指出输入超过模型上下文限制")
+	}
+	// Some ChatGPT responses contain only a human-readable detail.
+	m := strings.ToLower(p.Message)
+	switch {
+	case p.Code == "server_is_overloaded", p.Code == "slow_down", strings.Contains(m, "selected model is at capacity"):
+		return gate("UPSTREAM_OVERLOAD", source+"报告服务过载，请稍后再测")
+	case strings.Contains(m, "update your codex"), strings.Contains(m, "upgrade your codex"):
+		return client()
+	case strings.Contains(m, "reasoning effort") && (strings.Contains(m, "not supported") || strings.Contains(m, "does not support") || strings.Contains(m, "unsupported")):
+		return effort()
+	case strings.Contains(m, "model is not supported"), strings.Contains(m, "model is not available"), strings.Contains(m, "model not found"), strings.Contains(m, "does not exist or you do not have access"):
+		return model()
+	}
+	return nil
+}
+
+var upstreamRequestRef = regexp.MustCompile(`^(?:req_[0-9A-Fa-f]{16,64}|[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12})$`)
+
+func upstreamBadRequest(resp *http.Response) error {
+	source := "模型上游（HTTP 400）"
+	if id := resp.Header.Get("X-Request-Id"); upstreamRequestRef.MatchString(id) {
+		source = "模型上游（HTTP 400，请求编号 " + id + "）"
+	}
+	var message struct {
+		providerProblem
+		Error    providerProblem `json:"error"`
+		Detail   json.RawMessage `json:"detail"`
+		Response struct {
+			Error providerProblem `json:"error"`
+		} `json:"response"`
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, (16<<10)+1))
+	if err == nil && len(body) <= 16<<10 && json.Unmarshal(body, &message) == nil {
+		var detail providerProblem
+		if json.Unmarshal(message.Detail, &detail) != nil {
+			_ = json.Unmarshal(message.Detail, &detail.Message)
+		}
+		for _, problem := range []providerProblem{message.Error, message.Response.Error, detail, message.providerProblem} {
+			if hint := problem.diagnostic(source); hint != nil {
+				return hint
+			}
+		}
+	}
+	return gate("UPSTREAM_BAD_REQUEST", source+"拒绝本次请求，未给出可识别的具体原因")
+}
+
 type responseEvent struct {
-	Type     string `json:"type"`
-	Delta    string `json:"delta"`
-	Response struct {
-		Status string `json:"status"`
-		Model  string `json:"model"`
+	providerProblem                 // Some error events put code, param and message directly on the event.
+	Type            string          `json:"type"`
+	Delta           string          `json:"delta"`
+	Error           providerProblem `json:"error"`
+	Response        struct {
+		Status string          `json:"status"`
+		Model  string          `json:"model"`
+		Error  providerProblem `json:"error"`
 		Output []struct {
 			Type    string `json:"type"`
 			Role    string `json:"role"`
@@ -742,7 +850,14 @@ func readProbeStream(reader io.Reader) (ProbeAnswer, error) {
 			return empty, incomplete
 		}
 		switch ev.Type {
-		case "error", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+		case "error", "response.failed":
+			for _, problem := range []providerProblem{ev.providerProblem, ev.Error, ev.Response.Error} {
+				if hint := problem.diagnostic("模型上游在响应流内"); hint != nil {
+					return empty, hint
+				}
+			}
+			return empty, gate("UPSTREAM_STREAM_ERROR", "模型上游在响应流内报告失败，未给出可识别的具体原因")
+		case "response.incomplete", "response.cancelled", "response.canceled":
 			return empty, incomplete
 		case "response.refusal.delta", "response.refusal.done", "response.function_call_arguments.delta", "response.function_call_arguments.done":
 			return empty, refusal

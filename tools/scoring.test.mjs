@@ -114,3 +114,46 @@ test("interleaved accounts reuse question IDs without pooling each other’s ans
     ),
   );
 });
+
+test("parallel reports wait for the whole batch and match answers to the original account and question", () => {
+  const thirdB = sample(20, "q3", 17);
+  const failedB = { ...b[1], status: "failed", code: "TIMEOUT", text: "" };
+  const rows = [a[2], thirdB, a[0], b[0], a[1], failedB];
+  for (const status of ["waiting_capacity", "running", "done"]) {
+    const pendingRows = rows.map((row) =>
+      row === thirdB ? { ...row, status } : row,
+    );
+    const pending = accountReports(pendingRows, questions, bank, "running");
+    assert.ok(pending.every(({ result }) => result === null));
+    assert.deepEqual(pending.find(({ id }) => id === 10).rows, [
+      a[2],
+      a[0],
+      a[1],
+    ]);
+  }
+
+  const reports = new Map(
+    accountReports(rows, questions, bank, "done").map((report) => [
+      report.id,
+      report,
+    ]),
+  );
+  const first = reports.get(10);
+  const second = reports.get(20);
+  assert.deepEqual(first.result.score, upstream([a[2], a[0], a[1]]));
+  assert.deepEqual(second.result.score, upstream([thirdB, b[0]]));
+  assert.deepEqual([...first.result.accepted.keys()], ["q3", "q1", "q2"]);
+  assert.deepEqual([...second.result.accepted.keys()], ["q3", "q1"]);
+  assert.equal(
+    `${first.result.score.used_outputs}/${first.rows.length}`,
+    "3/3",
+  );
+  assert.equal(
+    `${second.result.score.used_outputs}/${second.rows.length}`,
+    "2/3",
+  );
+  assert.equal(
+    second.rows.find((row) => row.question_id === "q2").code,
+    "TIMEOUT",
+  );
+});

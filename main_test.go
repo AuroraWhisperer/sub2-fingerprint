@@ -192,7 +192,12 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	codes := make(map[string]string)
 	for _, row := range pending.Rows {
+		if row.RequestID == "" || codes[row.RequestID] != "" || strings.ContainsAny(row.RequestID, "- ") {
+			t.Fatal("each selected account and challenge must have a unique code before dispatch")
+		}
+		codes[row.RequestID] = fmt.Sprintf("%d/%s", row.AccountID, row.QuestionID)
 		if row.AccountID == 404 && row.Status != "queued" {
 			t.Fatal("fourth account started before a slot was free")
 		}
@@ -211,6 +216,9 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 		t.Fatal("wrong results")
 	}
 	for _, row := range r.Rows {
+		if codes[row.RequestID] != fmt.Sprintf("%d/%s", row.AccountID, row.QuestionID) {
+			t.Fatal("a reply changed the code assigned to the original account and challenge")
+		}
 		if !strings.Contains(row.Text, fmt.Sprintf("account=%d", row.AccountID)) || row.QuestionID == "" || row.RequestID == "" || row.Status != "done" {
 			t.Fatal("cross-account or missing result")
 		}
@@ -234,6 +242,47 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 	b.post("/api/login2fa", map[string]string{"code": "123456"})
 	if c, _, _ := b.call("GET", "/api/runs/"+req.ID, nil, ""); c != 404 {
 		t.Fatal("history owner mismatch")
+	}
+}
+func TestSelectedChallengeNumbersSurviveReopening(t *testing.T) {
+	a, m := testApp(t)
+	close(m.release)
+	b := testBrowser{t: t, a: a}
+	b.call("GET", "/api/session", nil, "")
+	if status, _, _ := b.post("/api/login", map[string]string{"email": "admin@example.com", "password": "fixture-password"}); status != http.StatusOK {
+		t.Fatal("login failed", status)
+	}
+	for n, selected := range [][]int{{3}, {2, 3}} {
+		status, _, body := b.call("GET", "/api/questions", nil, "")
+		var catalogue struct{ Questions []Question }
+		if status != http.StatusOK || json.Unmarshal([]byte(body), &catalogue) != nil || len(catalogue.Questions) != 3 {
+			t.Fatal("could not read the three challenges")
+		}
+		ids := make([]string, 0, len(selected))
+		for _, number := range selected {
+			q := catalogue.Questions[number-1]
+			if q.Number != number {
+				t.Fatalf("catalogue lists challenge %d as %d", number, q.Number)
+			}
+			ids = append(ids, q.ID)
+		}
+		req := RunRequest{ID: fmt.Sprintf("1eee2222-0000-4000-8000-%012d", n+1), Epoch: b.epoch, Accounts: []int64{101}, Questions: ids, Parallel: 1}
+		if status, _, _ := b.post("/api/runs", req); status != http.StatusAccepted {
+			t.Fatal("could not start selected challenges", status)
+		}
+		waitRun(t, a.queue, 11, req.ID)
+		b.call("GET", "/api/questions", nil, "") // Reloading the page fetches a fresh catalogue first.
+		status, _, body = b.call("GET", "/api/runs/"+req.ID, nil, "")
+		var reopened Run
+		if status != http.StatusOK || json.Unmarshal([]byte(body), &reopened) != nil || len(reopened.Questions) != len(selected) || len(reopened.Rows) != len(selected) {
+			t.Fatal("could not reopen selected challenges")
+		}
+		for i, number := range selected {
+			q := catalogue.Questions[number-1]
+			if reopened.Questions[i] != q || reopened.Rows[i].QuestionID != q.ID || reopened.Rows[i].Text != "account=101; question="+q.Prompt {
+				t.Fatalf("reopened result lost challenge %d", number)
+			}
+		}
 	}
 }
 func TestConfiguredParallelLimits(t *testing.T) {
@@ -431,7 +480,7 @@ func TestSelectionAndOrigin(t *testing.T) {
 
 func TestRejectedQuestionDoesNotSuppressIndependentChallenge(t *testing.T) {
 	for _, tc := range []struct{ code, second string }{
-		{"UPSTREAM_REFUSAL", "done"}, {"UPSTREAM_INCOMPLETE", "done"}, {"UPSTREAM_RATE_LIMIT", "failed"},
+		{"UPSTREAM_REFUSAL", "done"}, {"UPSTREAM_INCOMPLETE", "done"}, {"UPSTREAM_INPUT", "done"}, {"UPSTREAM_RATE_LIMIT", "failed"},
 	} {
 		t.Run(tc.code, func(t *testing.T) {
 			q, err := openQueue(t.TempDir(), "fixture-bank", func(ctx context.Context, jwt string, id int64, prompt string) (ProbeAnswer, error) {

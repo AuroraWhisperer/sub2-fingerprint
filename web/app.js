@@ -204,6 +204,16 @@ async function accounts() {
       el("span", item.name || "未命名账号", "name"),
       el("span", ` · #${item.id}`, "small"),
     );
+    if (
+      Number.isInteger(item.current_concurrency) &&
+      Number.isInteger(item.concurrency)
+    ) {
+      const limit = item.concurrency > 0 ? item.concurrency : "不限";
+      const full = item.eligible && item.concurrency > 0 &&
+        item.current_concurrency >= item.concurrency;
+      const capacity = `容量 ${item.current_concurrency} / ${limit}`;
+      description.append(el("br"), el("span", full ? `${capacity} · 有空位时开始检测` : capacity, "small"));
+    }
     if (item.reason)
       description.append(el("br"), el("span", item.reason, "small"));
     const state = statusNames.get(item.status) || item.status || "未知";
@@ -237,7 +247,7 @@ async function questions() {
       choice = el("label", null, "choice");
     choice.append(
       checkbox(item.id, index === 0, false),
-      el("span", `挑战 ${index + 1}`, "name"),
+      el("span", `挑战 ${item.number ?? index + 1}`, "name"),
       el("span", `${item.expected_count} 个数字`, "small"),
     );
     const detail = el("details");
