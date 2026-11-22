@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const maxParallelAccounts = 3
+const maxParallelAccounts = 1
 const maxRowsText = 12 << 10
 const maxSeenSubmissions = 1024
 
@@ -75,15 +75,17 @@ type ownedRun struct {
 	Run
 }
 type probeFunc func(context.Context, string, int64, string) (ProbeAnswer, error)
+type probeBatchFunc func(context.Context, string, int64, []string, probeBatchReporter) error
 type queue struct {
-	mu       sync.Mutex
-	version  string
-	current  *ownedRun
-	seen     map[string]struct{}
-	cancel   context.CancelFunc
-	stopping bool
-	wg       sync.WaitGroup
-	probe    probeFunc
+	mu         sync.Mutex
+	version    string
+	current    *ownedRun
+	seen       map[string]struct{}
+	cancel     context.CancelFunc
+	stopping   bool
+	wg         sync.WaitGroup
+	probe      probeFunc
+	probeBatch probeBatchFunc
 }
 
 func nonterminal(s string) bool { return s == "queued" || s == "waiting_capacity" || s == "running" }
@@ -261,6 +263,10 @@ func (q *queue) execute(ctx context.Context, jwt string, r *ownedRun) {
 		go func() {
 			defer workers.Done()
 			defer slot.release()
+			if q.probeBatch != nil && len(r.Questions) > 1 {
+				q.doBatch(ctx, jwt, r, a*len(r.Questions), slot)
+				return
+			}
 			for k, question := range r.Questions {
 				if !q.doRow(ctx, jwt, r, a*len(r.Questions)+k, question, slot) {
 					break
@@ -335,6 +341,79 @@ func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, quest
 	return ctx.Err() == nil
 }
 
+func (q *queue) doBatch(ctx context.Context, jwt string, r *ownedRun, start int, slot *accountSlot) {
+	q.mu.Lock()
+	if ctx.Err() != nil {
+		q.mu.Unlock()
+		return
+	}
+	for i := range r.Questions {
+		row := &r.Rows[start+i]
+		row.Status = "running"
+		row.Started = nowStamp()
+	}
+	r.State = "running"
+	q.mu.Unlock()
+
+	prompts := make([]string, len(r.Questions))
+	for i, question := range r.Questions {
+		prompts[i] = question.Prompt
+	}
+	accountID := r.Rows[start].AccountID
+	report := func(index int, answer ProbeAnswer, err error) {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		if index < 0 || index >= len(r.Questions) {
+			return
+		}
+		q.finishBatchRow(ctx, r, start+index, answer, err)
+	}
+	err := q.probeBatchWhenReady(ctx, jwt, r, start, accountID, prompts, slot, report)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if err == nil {
+		return
+	}
+	for i := range r.Questions {
+		row := &r.Rows[start+i]
+		if !nonterminal(row.Status) {
+			continue
+		}
+		q.finishBatchRow(ctx, r, start+i, ProbeAnswer{}, err)
+	}
+}
+
+func (q *queue) finishBatchRow(ctx context.Context, r *ownedRun, index int, answer ProbeAnswer, err error) {
+	row := &r.Rows[index]
+	row.Ended = nowStamp()
+	switch {
+	case ctx.Err() != nil || q.stopping:
+		row.Status = "cancelled"
+		if q.stopping {
+			row.Status = "interrupted"
+		}
+	case errors.Is(err, context.DeadlineExceeded):
+		row.Status = "failed"
+		row.Code = "TIMEOUT"
+		row.Error = "单题已超时"
+	case err != nil:
+		row.Status = "failed"
+		row.Error = "上游请求失败"
+		var ge *GateError
+		if errors.As(err, &ge) {
+			row.Code = ge.Code
+			row.Error = ge.Text
+		}
+	case answer.Text == "" || len(answer.Text) > maxRowsText:
+		row.Status = "failed"
+		row.Error = "回答为空或超出本题长度上限"
+	default:
+		row.Status = "done"
+		row.Text = answer.Text
+		row.Model = answer.Model
+	}
+}
+
 const capacityPollInterval = 5 * time.Second
 const capacityWaitLimit = 5 * time.Minute
 
@@ -372,6 +451,51 @@ func (q *queue) probeWhenReady(ctx context.Context, jwt string, row *Row, questi
 		}
 		q.mu.Lock()
 		row.Status = "running"
+		q.mu.Unlock()
+	}
+}
+
+func (q *queue) probeBatchWhenReady(ctx context.Context, jwt string, r *ownedRun, start int, accountID int64, prompts []string, slot *accountSlot, report probeBatchReporter) error {
+	var waitCtx context.Context
+	for {
+		deadline, cancel := context.WithTimeout(ctx, maxProbeBatchTimeout(len(prompts)))
+		err := q.probeBatch(deadline, jwt, accountID, prompts, report)
+		if deadline.Err() != nil {
+			err = deadline.Err()
+		}
+		cancel()
+		if err != errAccountFull {
+			return err
+		}
+		if waitCtx == nil {
+			var stopWaiting context.CancelFunc
+			waitCtx, stopWaiting = context.WithTimeout(ctx, capacityWaitLimit)
+			defer stopWaiting()
+		}
+		q.mu.Lock()
+		for i := range prompts {
+			row := &r.Rows[start+i]
+			if nonterminal(row.Status) {
+				row.Status = "waiting_capacity"
+			}
+		}
+		q.mu.Unlock()
+		slot.release()
+		select {
+		case <-waitCtx.Done():
+			return errCapacityTimeout
+		case <-time.After(capacityPollInterval):
+		}
+		if !slot.acquire(waitCtx) || waitCtx.Err() != nil {
+			return errCapacityTimeout
+		}
+		q.mu.Lock()
+		for i := range prompts {
+			row := &r.Rows[start+i]
+			if row.Status == "waiting_capacity" {
+				row.Status = "running"
+			}
+		}
 		q.mu.Unlock()
 	}
 }

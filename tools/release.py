@@ -14,6 +14,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_FILES = ('deploy.py','update.py','install.sh','uninstall.sh','update.sh',
                 'units/sub2-fingerprint.service','units/sub2-fingerprint.socket',
+                'units/sub2-fingerprint-update.path','units/sub2-fingerprint-update.service',
                 'DEPLOYMENT.md','Open-Detector.ps1','config.example.json')
 
 def sha(data):

@@ -12,9 +12,12 @@ export function loadBank() {
   return bankPromise;
 }
 async function readBank() {
-  const response = await fetch("/unified_bank.json", {
-    credentials: "same-origin",
-  });
+  const response = await fetch(
+    new URL("unified_bank.json", document.baseURI),
+    {
+      credentials: "same-origin",
+    },
+  );
   if (!response.ok) throw new Error("无法读取指纹库。");
   const bytes = await response.arrayBuffer();
   const sum = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
@@ -72,16 +75,10 @@ export function el(tag, text, className) {
   if (className) node.className = className;
   return node;
 }
-function details(title, key) {
-  const node = el("details");
-  node.dataset.detail = key;
-  node.append(el("summary", title));
-  return node;
-}
 const labels = {
   queued: "排队中",
-  waiting_capacity: "等待账号空位",
-  running: "检测中",
+  waiting_capacity: "等待空位",
+  running: "请求中",
   done: "已完成",
   failed: "失败",
   cancelled: "已取消",
@@ -90,106 +87,223 @@ const labels = {
 export const label = (state) => labels[state] || state || "未知";
 export const active = (state) =>
   state === "running" || state === "queued" || state === "waiting_capacity";
-export function date(value) {
-  if (!value || String(value).startsWith("0001-01-01")) return "";
-  const time = new Date(value);
-  return Number.isNaN(time.getTime())
-    ? ""
-    : time.toLocaleString("zh-CN", { hour12: false });
+
+function renderProgress(run) {
+  const progress = document.getElementById("runProgress");
+  const bar = document.getElementById("progressBar");
+  const labelNode = document.getElementById("progressLabel");
+  const detailNode = document.getElementById("progressDetail");
+  if (!progress || !bar || !labelNode || !detailNode) return;
+
+  const total = run.rows.length;
+  const complete = run.rows.filter((row) => !active(row.status)).length;
+  const inFlight = run.rows.filter((row) => row.status === "running").length;
+  const percentage = total ? Math.round((complete / total) * 100) : 0;
+  const isPending = active(run.state);
+  const visualPct = isPending
+    ? total
+      ? Math.max(
+          6,
+          Math.min(96, Math.round(((complete + inFlight * 0.35) / total) * 100)),
+        )
+      : 8
+    : percentage;
+
+  const runningRow = run.rows.find((row) => row.status === "running");
+  const waitingRow = run.rows.find((row) => row.status === "waiting_capacity");
+  const allFailed =
+    run.state === "done" &&
+    total > 0 &&
+    run.rows.every((row) => row.status === "failed");
+
+  let progressLabel = label(run.state);
+  if (isPending) {
+    if (runningRow) {
+      const acctName = runningRow.name || `#${runningRow.account_id}`;
+      progressLabel = `正在请求 ${acctName}…`;
+    } else if (waitingRow) {
+      const acctName = waitingRow.name || `#${waitingRow.account_id}`;
+      progressLabel = `${acctName} 等待并发空位…`;
+    } else {
+      progressLabel = "正在调度队列…";
+    }
+  } else if (allFailed) {
+    progressLabel = "检测失败";
+  } else if (run.state === "done") {
+    progressLabel = "检测完成";
+  } else if (run.state === "cancelled") {
+    progressLabel = "已取消";
+  } else if (run.state === "interrupted") {
+    progressLabel = "已中断";
+  }
+
+  const stateKey = allFailed ? "failed" : run.state;
+  labelNode.textContent = progressLabel;
+  detailNode.textContent = isPending
+    ? inFlight > 0
+      ? `${complete}/${total} · ${inFlight} 进行中`
+      : `${complete}/${total}`
+    : `${complete} / ${total}`;
+  progress.dataset.state = stateKey;
+  bar.setAttribute("aria-valuenow", String(percentage));
+  bar.setAttribute("aria-valuetext", `${complete} / ${total}`);
+  bar.dataset.state = stateKey;
+  bar.firstElementChild.style.width = `${visualPct}%`;
+  progress.hidden = false;
 }
+
 function percentage(fraction) {
   const value = fraction * 100;
   if (value > 0 && value < 0.01) return "<0.01%";
   if (value > 99.99 && value < 100) return ">99.99%";
   return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 }) + "%";
 }
-function probabilityList(score, key) {
-  const group = details(`全部 ${score.results.length} 个候选模型`, key);
-  const list = el("dl", null, "probs");
+
+function probabilityList(score) {
+  const group = el("div", null, "detail-box probs-box");
+  const sum = el("div", null, "detail-summary");
+  sum.append(
+    el("span", "候选模型分布"),
+    el("span", `${score.results.length} 个候选`, "detail-meta"),
+  );
+  group.append(sum);
+
+  const list = el("div", null, "probs");
   for (const candidate of score.results) {
-    list.append(
-      el("dt", candidate.display_name),
-      el("dd", percentage(candidate.probability)),
+    const row = el(
+      "div",
+      null,
+      `prob-row${candidate.probability >= 0.01 ? " notable" : ""}`,
     );
+    const track = el("span", null, "prob-bar");
+    const fill = el("span");
+    fill.style.width = `${Math.max(candidate.probability * 100, 0.4)}%`;
+    track.append(fill);
+    row.append(
+      el("span", candidate.display_name, "prob-name"),
+      track,
+      el("span", percentage(candidate.probability), "prob-val"),
+    );
+    list.append(row);
   }
   group.append(list);
   return group;
 }
-function appendScore(section, result, total) {
+
+function buildBadges(result, rows, pending, compatible) {
+  const wrap = el("div", null, "account-badges");
+  if (pending) {
+    const done = rows.filter((r) => !active(r.status)).length;
+    const isRunning = rows.some((r) => r.status === "running");
+    const isWaiting =
+      !isRunning && rows.some((r) => r.status === "waiting_capacity");
+    if (done === rows.length) {
+      wrap.append(
+        el("span", `已返回 ${done}/${rows.length}`, "sample-pill good"),
+      );
+    } else if (isRunning) {
+      wrap.append(
+        el("span", `请求中 ${done}/${rows.length}`, "sample-pill active"),
+      );
+    } else if (isWaiting) {
+      wrap.append(
+        el("span", `等待空位 ${done}/${rows.length}`, "sample-pill warning"),
+      );
+    } else {
+      wrap.append(el("span", `排队中 ${done}/${rows.length}`, "sample-pill"));
+    }
+    return wrap;
+  }
+  if (!compatible) return wrap;
   const score = result?.score;
   if (!score) {
-    section.append(el("p", "没有可用于归因的有效答案。", "small"));
-    return;
+    wrap.append(el("span", "无有效输出", "sample-pill warning"));
+    return wrap;
   }
-  const line = el("div", null, "metrics");
-  const winner = el("span", `最可能：${score.prediction_name} `);
-  winner.append(el("strong", percentage(score.probability)));
-  line.append(winner);
+  const primary = el("span", null, "pred-badge");
+  primary.append(
+    el("span", score.prediction_name, "pred-name"),
+    el("strong", percentage(score.probability)),
+  );
+  wrap.append(primary);
   if (score.prediction !== "gpt-6-astra") {
     const astra = score.results.find((item) => item.model === "gpt-6-astra");
     if (astra) {
-      const astraline = el("span", "Astra ");
-      astraline.append(el("strong", percentage(astra.probability)));
-      line.append(astraline);
+      const sub = el("span", null, "pred-badge secondary");
+      sub.append(
+        el("span", "Astra", "pred-name"),
+        el("strong", percentage(astra.probability)),
+      );
+      wrap.append(sub);
     }
   }
-  section.append(
-    line,
-    el("p", `本次计入 ${score.used_outputs}/${total} 道题。`, "small"),
+  wrap.append(
+    el("span", `有效 ${score.used_outputs}/${rows.length}`, "sample-pill"),
   );
+  return wrap;
 }
+
 function answer(row, question, accepted) {
-  const node = details(
-    `挑战 ${question?.number ?? "?"} · ${label(row.status)}${accepted === false ? " · 输出无效" : ""}`,
-    `r-${row.account_id}-${row.question_id}`,
-  );
-  node.classList.add("answer");
-  if (row.error) {
-    const diagnostic = row.code ? `${row.error} · ${row.code}` : row.error;
-    node.append(el("p", diagnostic, "small warning"));
+  const node = el("div", null, "detail-box answer");
+  const sum = el("div", null, "detail-summary");
+  sum.append(el("span", `挑战 ${question?.number ?? "?"}`, "ans-title"));
+
+  const meta = el("span", null, "detail-meta");
+  if (row.model) {
+    meta.append(el("span", row.model, "model-tag"));
   }
-  if (row.model) node.append(el("p", `上游返回标签：${row.model}`, "small"));
-  const timing = [date(row.started), date(row.ended)]
-    .filter(Boolean)
-    .join(" — ");
-  if (timing) node.append(el("p", timing, "small"));
-  if (row.request_id)
-    node.append(el("p", `检测编号 ${row.request_id}`, "small"));
-  if (question) node.append(el("h4", "题目"), el("pre", question.prompt));
-  if (row.text) node.append(el("h4", "原始答案"), el("pre", row.text));
+  const statusText =
+    accepted === false ? "输出无效" : label(row.status);
+  const statusTone =
+    accepted === false || row.status === "failed"
+      ? "bad"
+      : row.status === "done"
+        ? "good"
+        : row.status === "running"
+          ? "active"
+          : "";
+  meta.append(el("span", statusText, `state ${statusTone}`.trim()));
+  sum.append(meta);
+  node.append(sum);
+
+  const body = el("div", null, "answer-body");
+  if (row.error) {
+    const diagnostic = row.code ? `${row.error} (${row.code})` : row.error;
+    body.append(el("p", diagnostic, "ans-error"));
+  }
+  if (row.text) {
+    body.append(el("pre", row.text));
+  } else if (!row.error) {
+    const waitCopy =
+      row.status === "running"
+        ? "正在等待上游模型返回输出…"
+        : row.status === "waiting_capacity"
+          ? "账号并发已满，正在等待空位…"
+          : row.status === "queued"
+            ? "等待前序请求完成后发起…"
+            : "暂无输出";
+    body.append(el("p", waitCopy, "footnote"));
+  }
+  node.append(body);
   return node;
 }
+
 export function renderRun(container, run, bank, bankVersion) {
-  const opened = new Set(
-    Array.from(
-      container.querySelectorAll("details[open]"),
-      (item) => item.dataset.detail,
-    ),
-  );
   const questions = new Map(run.questions.map((q) => [q.id, q]));
   const out = document.createDocumentFragment();
-  const complete = run.rows.filter((row) => !active(row.status)).length;
-  const summary = el("div", null, "summary");
-  summary.append(
-    el("h3", run.state === "done" && run.rows.every((row) => row.status === "failed")
-      ? "本次检测失败" : label(run.state)),
-    el("span", `已结束 ${complete}/${run.rows.length} 个请求`, "small"),
-  );
-  out.append(summary);
+  renderProgress(run);
+
   const compatible = Boolean(
     run.bank_version && run.bank_version === bankVersion && bank,
   );
   const pending = active(run.state);
-  if (!run.bank_version || run.bank_version !== bankVersion)
+  if (!run.bank_version || run.bank_version !== bankVersion) {
     out.append(
-      el(
-        "p",
-        "当前评分库与本批次的版本不一致，请查看原始答案。",
-        "warning",
-      ),
+      el("p", "指纹库与当前批次版本不一致，仅显示原始输出。", "warning-banner"),
     );
-  else if (pending && bank)
-    out.append(el("p", "本批检测结束后计算各账号的归因概率。", "small"));
+  }
+
+  const list = el("div", null, "account-list");
   for (const { id, rows, result } of accountReports(
     run.rows,
     questions,
@@ -197,25 +311,28 @@ export function renderRun(container, run, bank, bankVersion) {
     run.state,
   )) {
     const section = el("article", null, "account-result");
-    section.append(el("h3", `${rows[0].name || "账号"} · #${id}`));
-    if (compatible && !pending) appendScore(section, result, rows.length);
-    if (result?.score) section.append(probabilityList(result.score, `p-${id}`));
+    const head = el("div", null, "account-head");
+    const title = el("div", null, "account-title");
+    title.append(
+      el("h3", rows[0].name || "账号"),
+      el("span", `#${id}`, "acct-id"),
+    );
+    head.append(title, buildBadges(result, rows, pending, compatible));
+    section.append(head);
+
+    if (result?.score) {
+      section.append(probabilityList(result.score));
+    }
+    const answersWrap = el("div", null, "answers-grid");
     for (const row of rows) {
       const q = questions.get(row.question_id);
-      section.append(
+      answersWrap.append(
         answer(row, q, result?.accepted.get(row.question_id)),
       );
     }
-    out.append(section);
+    section.append(answersWrap);
+    list.append(section);
   }
-  out.append(
-    el(
-      "p",
-      "概率仅比较指纹库内的候选，描述本次请求的输出。轻度是请求档位。",
-      "footnote report-note",
-    ),
-  );
+  out.append(list);
   container.replaceChildren(out);
-  for (const item of container.querySelectorAll("details"))
-    item.open = opened.has(item.dataset.detail);
 }

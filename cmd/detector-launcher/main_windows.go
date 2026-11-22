@@ -19,7 +19,7 @@ import (
 )
 
 const port = 17861
-const home = "http://127.0.0.1:17861/"
+const home = "https://lirahub.dpdns.org/modeltrace/"
 const forward = "127.0.0.1:17861:127.0.0.1:17861"
 
 var targetName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._@:-]{0,252}$`)
@@ -185,14 +185,7 @@ func waitForIdle(pid uint32, localPort uint16, idle, interval time.Duration) err
 
 func main() {
 	check := len(os.Args) == 2 && os.Args[1] == "-check"
-	exe, err := os.Executable()
-	if err == nil {
-		var target string
-		target, err = targetFor(exe)
-		if err == nil {
-			err = launch(exe, target, check)
-		}
-	}
+	err := openPage(check)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		if !check {

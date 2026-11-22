@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,61 +13,70 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	probeModel        = "gpt-6-astra"
-	responsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
-	codexRuntimePath  = "/opt/sub2-fingerprint-runtime/codex-app-server"
+	probeReasoning    = "low"
+	probeInstruction  = "Answer the numerical challenge directly. Do not use tools."
+	probeGroupDefault = "Probe"
 	apiLimit          = 3 << 20
 	answerLimit       = 32 << 10
+	probeTimeout      = 180 * time.Second
+	probeMaxAttempts  = 5
+	adminTimeout      = 18 * time.Second
+	cleanupTimeout    = 20 * time.Second
 )
 
-type GateError struct{ Code, Text string }
+const probeBatchAdminCalls = 4
 
-func (e *GateError) Error() string      { return e.Text }
-func gate(code, text string) *GateError { return &GateError{Code: code, Text: text} }
-
-type LoginResult struct {
-	JWT, Refresh, Temp string
-	ExpiresIn          int
-	Admin              bool
-	UserID             int64
-}
-type AccountView struct {
-	ID       int64  `json:"id"`
-	Name     string `json:"name"`
-	Status   string `json:"status"`
-	Reason   string `json:"reason"`
-	Eligible bool   `json:"eligible"`
-	Used     *int   `json:"current_concurrency,omitempty"`
-	Limit    *int   `json:"concurrency,omitempty"`
-}
-type ProbeAnswer struct {
-	Text      string `json:"text"`
-	Model     string `json:"model"`
-	RequestID string `json:"request_id,omitempty"`
-}
+var (
+	headerValue  = regexp.MustCompile("^[\\x20-\\x7e]+$")
+	accountLabel = regexp.MustCompile("^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+	modelLabel   = regexp.MustCompile("^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+)
 
 type Adapter struct {
-	base              string
-	admin             *http.Client
-	upstream          string // fixed in production; isolated TLS server in tests
-	upstreamTransport *http.Transport
-	codexBinary       string
-	runCodex          func(context.Context, string, string, string, string, string) error
+	base           string
+	gateway        string
+	admin          *http.Client
+	gatewayClient  *http.Client
+	probeKey       string
+	probeGroupName string
+	requestTimeout time.Duration
+	retryDelay     time.Duration
+	groupMu        sync.Mutex
+	recoveryMu     sync.RWMutex
+	recoveryFailed bool
 }
 
 func newTransport() *http.Transport {
-	return &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, TLSHandshakeTimeout: 15 * time.Second, MaxResponseHeaderBytes: 48 << 10, MaxIdleConns: 4, IdleConnTimeout: 30 * time.Second, ForceAttemptHTTP2: true}
+	return &http.Transport{
+		Proxy:                  nil,
+		DialContext:            (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSClientConfig:        &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout:    15 * time.Second,
+		MaxResponseHeaderBytes: 48 << 10,
+		MaxIdleConns:           4,
+		IdleConnTimeout:        30 * time.Second,
+		ForceAttemptHTTP2:      true,
+	}
 }
+
 func rejectRedirect(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 
-// Accept either a site origin or an explicit /api/v1 URL. HTTP is local only.
+// NewAdapter creates an admin-only adapter for tests and non-probe operations.
+// Production must use NewConfiguredAdapter so a Probe key and exact group name exist.
 func NewAdapter(base string) (*Adapter, error) {
+	return NewConfiguredAdapter(base, "", probeGroupDefault)
+}
+
+func NewConfiguredAdapter(base, probeKey, probeGroupName string) (*Adapter, error) {
 	parsed, err := url.Parse(strings.TrimSpace(base))
 	if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawPath != "" {
 		return nil, gate("CONFIG", "Sub2API 地址无效")
@@ -80,8 +88,52 @@ func NewAdapter(base string) (*Adapter, error) {
 	if path != "" && path != "/api/v1" {
 		return nil, gate("CONFIG", "请使用 Sub2API 站点地址或 /api/v1")
 	}
-	parsed.Path = "/api/v1"
-	return &Adapter{base: parsed.String(), admin: &http.Client{Transport: newTransport(), Timeout: 18 * time.Second, CheckRedirect: rejectRedirect}, upstream: responsesEndpoint, upstreamTransport: newTransport(), codexBinary: codexRuntimePath, runCodex: runCodexProcess}, nil
+	if probeKey != "" && !panelToken(probeKey) {
+		return nil, gate("CONFIG", "Probe API Key 无效")
+	}
+	if probeGroupName == "" {
+		probeGroupName = probeGroupDefault
+	}
+	if len(probeGroupName) > 128 || strings.TrimSpace(probeGroupName) != probeGroupName {
+		return nil, gate("CONFIG", "Probe 分组名称无效")
+	}
+	gatewayURL := *parsed
+	gatewayURL.Path = ""
+	gatewayURL.RawPath = ""
+	adminURL := *parsed
+	adminURL.Path = "/api/v1"
+	adminURL.RawPath = ""
+	return &Adapter{
+		base:           strings.TrimSuffix(adminURL.String(), "/"),
+		gateway:        strings.TrimSuffix(gatewayURL.String(), "/"),
+		admin:          &http.Client{Transport: newTransport(), Timeout: adminTimeout, CheckRedirect: rejectRedirect},
+		gatewayClient:  &http.Client{Transport: newTransport(), Timeout: probeTimeout, CheckRedirect: rejectRedirect},
+		probeKey:       probeKey,
+		probeGroupName: probeGroupName,
+		requestTimeout: probeTimeout,
+		retryDelay:     time.Second,
+	}, nil
+}
+
+func probeBatchTimeout(requestTimeout time.Duration, promptCount int, concurrency int) time.Duration {
+	if requestTimeout <= 0 {
+		requestTimeout = probeTimeout
+	}
+	if promptCount < 1 {
+		promptCount = 1
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > promptCount {
+		concurrency = promptCount
+	}
+	waves := (promptCount + concurrency - 1) / concurrency
+	return time.Duration(waves)*requestTimeout + probeBatchAdminCalls*adminTimeout
+}
+
+func maxProbeBatchTimeout(promptCount int) time.Duration {
+	return probeBatchTimeout(probeTimeout, promptCount, 1)
 }
 
 func httpFailure(ctx context.Context, err error, side string) error {
@@ -196,6 +248,32 @@ func (a *Adapter) call(ctx context.Context, method, path, jwt string, payload, d
 	return nil
 }
 
+type GateError struct{ Code, Text string }
+
+func (e *GateError) Error() string      { return e.Text }
+func gate(code, text string) *GateError { return &GateError{Code: code, Text: text} }
+
+type LoginResult struct {
+	JWT, Refresh, Temp string
+	ExpiresIn          int
+	Admin              bool
+	UserID             int64
+}
+type AccountView struct {
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Reason   string `json:"reason"`
+	Eligible bool   `json:"eligible"`
+	Used     *int   `json:"current_concurrency,omitempty"`
+	Limit    *int   `json:"concurrency,omitempty"`
+}
+type ProbeAnswer struct {
+	Text      string `json:"text"`
+	Model     string `json:"model"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
 func (a *Adapter) login(ctx context.Context, path string, payload any) (LoginResult, error) {
 	var r struct {
 		Token   string `json:"access_token"`
@@ -288,10 +366,11 @@ func (a *Adapter) Refresh(ctx context.Context, refresh string) (LoginResult, err
 	return LoginResult{JWT: pair.JWT, Refresh: pair.Refresh, ExpiresIn: pair.Expires}, nil
 }
 
-// VerifyAdmin gets the live, flat user profile for the access token.
-func (a *Adapter) VerifyAdmin(ctx context.Context, jwt string, expectedUserID int64) error {
-	if expectedUserID <= 0 || !panelToken(jwt) {
-		return sessionInvalid
+// CurrentAdmin gets the live, flat administrator profile for a browser access token.
+// The detector deliberately does not accept or rotate the browser refresh token.
+func (a *Adapter) CurrentAdmin(ctx context.Context, jwt string) (int64, error) {
+	if !panelToken(jwt) {
+		return 0, sessionInvalid
 	}
 	var me struct {
 		ID     int64  `json:"id"`
@@ -299,12 +378,27 @@ func (a *Adapter) VerifyAdmin(ctx context.Context, jwt string, expectedUserID in
 		Status string `json:"status"`
 	}
 	if err := a.call(ctx, http.MethodGet, "/auth/me", jwt, nil, &me); err != nil {
-		return sessionFault(err)
+		return 0, sessionFault(err)
 	}
 	if me.ID <= 0 || me.Role == "" || me.Status == "" {
-		return sessionTemporary
+		return 0, sessionTemporary
 	}
-	if me.ID != expectedUserID || me.Role != "admin" || me.Status != "active" {
+	if me.Role != "admin" || me.Status != "active" {
+		return 0, sessionInvalid
+	}
+	return me.ID, nil
+}
+
+// VerifyAdmin gets the live, flat user profile for a stored detector session.
+func (a *Adapter) VerifyAdmin(ctx context.Context, jwt string, expectedUserID int64) error {
+	if expectedUserID <= 0 {
+		return sessionInvalid
+	}
+	id, err := a.CurrentAdmin(ctx, jwt)
+	if err != nil {
+		return err
+	}
+	if id != expectedUserID {
 		return sessionInvalid
 	}
 	return nil
@@ -330,68 +424,34 @@ func (a *Adapter) Logout(ctx context.Context, refresh string) error {
 	return a.call(ctx, "POST", "/auth/logout", "", map[string]string{"refresh_token": refresh}, &r)
 }
 
-type routeProxy struct {
-	ID       int64           `json:"id"`
-	Key      string          `json:"proxy_key"`
-	Protocol string          `json:"protocol"`
-	Host     string          `json:"host"`
-	Port     int             `json:"port"`
-	Status   string          `json:"status"`
-	Username string          `json:"username"`
-	Password string          `json:"password"`
-	Expires  json.RawMessage `json:"expires_at"`
-}
 type accountRules struct {
 	CodexCLIOnly bool `json:"codex_cli_only"`
 }
-type credentialData struct {
-	Token      string            `json:"access_token"`
-	Expires    json.RawMessage   `json:"expires_at"`
-	AccountID  string            `json:"chatgpt_account_id"`
-	FedRAMP    json.RawMessage   `json:"chatgpt_account_is_fedramp"`
-	UA         string            `json:"user_agent"`
-	Mode       string            `json:"auth_mode"`
-	LegacyMode string            `json:"openai_auth_mode"`
-	Mapping    map[string]string `json:"model_mapping"`
-	Override   bool              `json:"header_override_enabled"`
-}
+
 type accountData struct {
-	ID          int64          `json:"id"`
-	Name        string         `json:"name"`
-	Platform    string         `json:"platform"`
-	Type        string         `json:"type"`
-	Status      string         `json:"status"`
-	Schedulable *bool          `json:"schedulable"`
-	Busy        *int           `json:"current_concurrency"`
-	Limit       *int           `json:"concurrency"`
-	Parent      *int64         `json:"parent_account_id"`
-	Expires     *int64         `json:"expires_at"`
-	Limited     *time.Time     `json:"rate_limit_reset_at"`
-	Overload    *time.Time     `json:"overload_until"`
-	TempPause   *time.Time     `json:"temp_unschedulable_until"`
-	ProxyID     *int64         `json:"proxy_id"`
-	Proxy       *routeProxy    `json:"proxy"`
-	Cred        credentialData `json:"credentials"`
-	Rules       accountRules   `json:"extra"`
+	ID          int64        `json:"id"`
+	Name        string       `json:"name"`
+	Platform    string       `json:"platform"`
+	Type        string       `json:"type"`
+	Status      string       `json:"status"`
+	Schedulable *bool        `json:"schedulable"`
+	Busy        *int         `json:"current_concurrency"`
+	Limit       *int         `json:"concurrency"`
+	Parent      *int64       `json:"parent_account_id"`
+	Expires     *int64       `json:"expires_at"`
+	Limited     *time.Time   `json:"rate_limit_reset_at"`
+	Overload    *time.Time   `json:"overload_until"`
+	TempPause   *time.Time   `json:"temp_unschedulable_until"`
+	GroupIDs    []int64      `json:"group_ids"`
+	Rules       accountRules `json:"extra"`
 }
 
-func ordinaryOAuth(c credentialData) bool {
-	for _, s := range []string{c.Mode, c.LegacyMode} {
-		switch strings.ToLower(strings.TrimSpace(s)) {
-		case "", "oauth", "chatgpt":
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// Only the pre-export capacity check may return this sentinel. It is safe to retry.
+// Only the pre-request capacity check may return this sentinel. It is safe to retry.
 var errAccountFull = gate("ACCOUNT_FULL", "账号并发已满，等待空位")
 
 func (r accountData) eligibility(now time.Time) string {
 	switch {
-	case r.ID <= 0 || r.Platform != "openai" || r.Type != "oauth" || r.Parent != nil || !ordinaryOAuth(r.Cred):
+	case r.ID <= 0 || r.Platform != "openai" || r.Type != "oauth" || r.Parent != nil:
 		return "仅支持普通 OpenAI OAuth 账号"
 	case r.Rules.CodexCLIOnly:
 		return "账号设置为仅允许 Codex 官方客户端"
@@ -408,6 +468,7 @@ func (r accountData) eligibility(now time.Time) string {
 	}
 	return ""
 }
+
 func (a *Adapter) List(ctx context.Context, jwt string) ([]AccountView, error) {
 	accounts := []AccountView{}
 	seen := map[int64]bool{}
@@ -439,169 +500,246 @@ func (a *Adapter) List(ctx context.Context, jwt string) ([]AccountView, error) {
 	return nil, gate("ADMIN_FORMAT", "账号页数超出上限")
 }
 
-type exportData struct {
-	Accounts []struct {
-		Name     string         `json:"name"`
-		Platform string         `json:"platform"`
-		Type     string         `json:"type"`
-		Cred     credentialData `json:"credentials"`
-		Rules    accountRules   `json:"extra"`
-		ProxyKey *string        `json:"proxy_key"`
-	} `json:"accounts"`
-	Proxies        []routeProxy `json:"proxies"`
-	SkippedShadows int          `json:"skipped_shadows"`
+type groupData struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
 }
 
-func (r exportData) proxy(account accountData) (*url.URL, error) {
-	mismatch := gate("PROXY_CONFIG", "账号的代理资料不完整或有变动，请在 Sub2API 检查后重试")
-	key := r.Accounts[0].ProxyKey
-	if account.ProxyID == nil {
-		if key != nil || account.Proxy != nil || len(r.Proxies) != 0 {
-			return nil, mismatch
+type groupList []groupData
+
+func (g *groupList) UnmarshalJSON(raw []byte) error {
+	var list []groupData
+	if err := json.Unmarshal(raw, &list); err == nil {
+		*g = list
+		return nil
+	}
+	var envelope struct {
+		Items  []groupData `json:"items"`
+		Groups []groupData `json:"groups"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return err
+	}
+	if envelope.Items != nil {
+		*g = envelope.Items
+	} else {
+		*g = envelope.Groups
+	}
+	return nil
+}
+
+func containsGroup(groups []int64, id int64) bool {
+	for _, group := range groups {
+		if group == id {
+			return true
 		}
-		return nil, nil
 	}
-	if account.Proxy == nil || *account.ProxyID <= 0 || account.Proxy.ID != *account.ProxyID || key == nil || *key == "" || len(r.Proxies) != 1 {
-		return nil, mismatch
+	return false
+}
+
+func sameGroupSet(left, right []int64) bool {
+	if len(left) != len(right) {
+		return false
 	}
-	p := r.Proxies[0]
-	d := account.Proxy
-	if p.Key != *key || d.Host != p.Host || d.Port != p.Port || d.Protocol != p.Protocol || d.Username != p.Username || p.Status != "active" || d.Status != "active" {
-		return nil, mismatch
+	l := append([]int64(nil), left...)
+	r := append([]int64(nil), right...)
+	sort.Slice(l, func(i, j int) bool { return l[i] < l[j] })
+	sort.Slice(r, func(i, j int) bool { return r[i] < r[j] })
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
 	}
-	for _, raw := range []json.RawMessage{d.Expires, p.Expires} {
-		if len(raw) != 0 && string(raw) != "null" {
-			until, ok := expiry(raw)
-			if !ok || !time.Now().Before(until) {
-				return nil, gate("PROXY_CONFIG", "代理有效期已过或无法确认，请在 Sub2API 核对")
+	return true
+}
+
+func copyGroups(groups []int64) []int64 { return append([]int64(nil), groups...) }
+
+func (a *Adapter) findProbeGroup(ctx context.Context, jwt string) (int64, error) {
+	var groups groupList
+	if err := a.call(ctx, http.MethodGet, "/admin/groups/all", jwt, nil, &groups); err != nil {
+		return 0, err
+	}
+	var found int64
+	for _, group := range groups {
+		if group.ID <= 0 || group.Name == "" {
+			return 0, gate("GROUP_FORMAT", "Sub2API 分组列表格式不完整")
+		}
+		if group.Name == a.probeGroupName {
+			if found != 0 {
+				return 0, gate("GROUP_AMBIGUOUS", "Sub2API 中存在多个同名 Probe 分组")
 			}
+			found = group.ID
 		}
 	}
-	switch p.Protocol {
-	case "http", "https", "socks5", "socks5h":
-	default:
-		return nil, gate("PROXY_CONFIG", "当前代理协议不受支持")
+	if found == 0 {
+		return 0, gate("GROUP_NOT_FOUND", "Sub2API 中未找到名为"+a.probeGroupName+"的分组")
 	}
-	if p.Port < 1 || p.Port > 65535 || p.Host == "" || strings.ContainsAny(p.Host, "/\\%@?# \r\n\t") {
-		return nil, mismatch
-	}
-	if strings.Contains(p.Host, ":") && net.ParseIP(p.Host) == nil {
-		return nil, mismatch
-	}
-	u := &url.URL{Scheme: p.Protocol, Host: net.JoinHostPort(p.Host, strconv.Itoa(p.Port))}
-	if p.Username != "" || p.Password != "" {
-		u.User = url.UserPassword(p.Username, p.Password)
-	}
-	return u, nil
+	return found, nil
 }
 
-func expiry(raw json.RawMessage) (time.Time, bool) {
-	s := strings.TrimSpace(string(raw))
-	if strings.HasPrefix(s, "\"") {
-		if json.Unmarshal(raw, &s) != nil {
-			return time.Time{}, false
-		}
+func (a *Adapter) accountDetail(ctx context.Context, jwt string, id int64) (accountData, error) {
+	var row accountData
+	if err := a.call(ctx, http.MethodGet, "/admin/accounts/"+strconv.FormatInt(id, 10), jwt, nil, &row); err != nil {
+		return accountData{}, err
 	}
-	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return time.Unix(i, 0), true
+	if row.ID != id || row.Name == "" || row.GroupIDs == nil {
+		return accountData{}, gate("ACCOUNT_MISMATCH", "所选账号资料缺少有效分组信息")
 	}
-	t, err := time.Parse(time.RFC3339, s)
-	return t, err == nil
+	return row, nil
 }
 
-// JWT claims here are only additional consistency checks; upstream authenticates the token.
-func bearerMetadata(token string) (account string, expires time.Time, ok bool) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return "", time.Time{}, false
+func (a *Adapter) updateAccountGroups(ctx context.Context, jwt string, id int64, groups []int64) error {
+	return a.call(ctx, http.MethodPut, "/admin/accounts/"+strconv.FormatInt(id, 10), jwt, map[string]any{"group_ids": groups}, &struct{}{})
+}
+
+func (a *Adapter) markRecoveryFailed() {
+	a.recoveryMu.Lock()
+	a.recoveryFailed = true
+	a.recoveryMu.Unlock()
+}
+
+func (a *Adapter) recoveryBlocked() bool {
+	a.recoveryMu.RLock()
+	defer a.recoveryMu.RUnlock()
+	return a.recoveryFailed
+}
+
+func (a *Adapter) restoreGroups(ctx context.Context, jwt string, id int64, original []int64) error {
+	if err := a.updateAccountGroups(ctx, jwt, id, original); err != nil {
+		return err
 	}
-	b, err := base64.RawURLEncoding.DecodeString(parts[1])
+	row, err := a.accountDetail(ctx, jwt, id)
 	if err != nil {
-		return "", time.Time{}, false
+		return err
 	}
-	var claims struct {
-		Exp  json.RawMessage `json:"exp"`
-		Auth struct {
-			ID string `json:"chatgpt_account_id"`
-		} `json:"https://api.openai.com/auth"`
+	if !sameGroupSet(row.GroupIDs, original) {
+		return gate("GROUP_RESTORE_FAILED", "账号原分组恢复后核对不一致")
 	}
-	if json.Unmarshal(b, &claims) != nil {
-		return "", time.Time{}, false
-	}
-	t, valid := expiry(claims.Exp)
-	return claims.Auth.ID, t, valid
+	return nil
 }
 
-func mappingAllowsAstra(m map[string]string) bool {
-	if len(m) == 0 {
-		return true
+func (a *Adapter) probeGroupTransaction(ctx context.Context, jwt string, id int64, fn func(context.Context) error) (err error) {
+	if a.recoveryBlocked() {
+		return gate("GROUP_RECOVERY_BLOCKED", "上一次账号分组恢复失败，已阻止后续分组变更")
 	}
-	target, ok := m[probeModel]
-	if !ok {
-		longest := -1
-		for key, v := range m {
-			if strings.HasSuffix(key, "*") && strings.HasPrefix(probeModel, strings.TrimSuffix(key, "*")) && len(key) > longest {
-				longest, target, ok = len(key), v, true
-			}
+	if err := ctx.Err(); err != nil {
+		return httpFailure(ctx, err, "检测 ")
+	}
+	a.groupMu.Lock()
+	defer a.groupMu.Unlock()
+	if a.recoveryBlocked() {
+		return gate("GROUP_RECOVERY_BLOCKED", "上一次账号分组恢复失败，已阻止后续分组变更")
+	}
+	groupID, err := a.findProbeGroup(ctx, jwt)
+	if err != nil {
+		return err
+	}
+	row, err := a.accountDetail(ctx, jwt, id)
+	if err != nil {
+		return err
+	}
+	original := copyGroups(row.GroupIDs)
+	if containsGroup(original, groupID) {
+		return fn(ctx)
+	}
+	expected := append(copyGroups(original), groupID)
+	restoreNeeded := true
+	defer func() {
+		if !restoreNeeded {
+			return
 		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		if restoreErr := a.restoreGroups(cleanupCtx, jwt, id, original); restoreErr != nil {
+			a.markRecoveryFailed()
+			err = gate("GROUP_RESTORE_FAILED", "账号原分组恢复失败，已阻止后续分组变更")
+		}
+	}()
+	if err := a.updateAccountGroups(ctx, jwt, id, expected); err != nil {
+		return err
 	}
-	return ok && (target == probeModel || target == "gpt-6")
+	attached, err := a.accountDetail(ctx, jwt, id)
+	if err != nil {
+		return err
+	}
+	if !sameGroupSet(attached.GroupIDs, expected) || !containsGroup(attached.GroupIDs, groupID) {
+		return gate("GROUP_ATTACH_FAILED", "账号加入 Probe 分组后核对不一致，未向模型发题")
+	}
+	return fn(ctx)
 }
 
-var headerValue = regexp.MustCompile(`^[\x20-\x7e]+$`)
-var accountLabel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$`)
-var clientUA = regexp.MustCompile(`^([\w.-]{1,64})/([0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)`)
-var modelLabel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
+func (a *Adapter) groupTransaction(ctx context.Context, jwt string, id int64, fn func(context.Context) (ProbeAnswer, error)) (answer ProbeAnswer, err error) {
+	err = a.probeGroupTransaction(ctx, jwt, id, func(ctx context.Context) error {
+		answer, err = fn(ctx)
+		return err
+	})
+	if err != nil {
+		return ProbeAnswer{}, err
+	}
+	return answer, nil
+}
 
-func requestHeaders(detail accountData, cred credentialData, now time.Time) (http.Header, error) {
-	invalid := gate("IDENTITY", "账号凭据或身份信息缺失／不一致")
-	if !ordinaryOAuth(cred) || cred.Override {
-		return nil, gate("UNSUPPORTED_ACCOUNT", "账号认证或请求头配置需要专用适配")
+type probeBatchReporter func(index int, answer ProbeAnswer, err error)
+
+func (a *Adapter) ProbeBatch(ctx context.Context, jwt string, id int64, prompts []string, report probeBatchReporter) error {
+	if id <= 0 || len(prompts) == 0 || len(prompts) > 3 {
+		return gate("INVALID", "账号或题目无效")
 	}
-	if !mappingAllowsAstra(cred.Mapping) {
-		return nil, gate("MODEL_MAPPING", "该账号的模型映射未允许 Astra 原样发送")
-	}
-	if cred.Token == "" || len(cred.Token) > 48<<10 || strings.ContainsAny(cred.Token, " \t\r\n") || !headerValue.MatchString(cred.Token) {
-		return nil, invalid
-	}
-	id, tokenExpiry, hasTokenExpiry := bearerMetadata(cred.Token)
-	if id != "" && cred.AccountID != "" && id != cred.AccountID {
-		return nil, invalid
-	}
-	if cred.AccountID != "" {
-		id = cred.AccountID
-	}
-	if !accountLabel.MatchString(id) || detail.Cred.AccountID != "" && detail.Cred.AccountID != id {
-		return nil, invalid
-	}
-	t, has := expiry(cred.Expires)
-	if len(cred.Expires) > 0 && string(cred.Expires) != "null" && !has {
-		return nil, gate("TOKEN_EXPIRY", "无法验证该账号令牌有效期")
-	}
-	if hasTokenExpiry && (!has || tokenExpiry.Before(t)) {
-		t, has = tokenExpiry, true
-	}
-	if !has || !now.Before(t) {
-		return nil, gate("UPSTREAM_TOKEN", "请等待 Sub2API 刷新凭据，或在原面板刷新后重试")
-	}
-	h := make(http.Header)
-	h.Set("Authorization", "Bearer "+cred.Token)
-	h.Set("ChatGPT-Account-Id", id)
-	fed := strings.Trim(string(cred.FedRAMP), "\"")
-	switch strings.ToLower(fed) {
-	case "true", "1":
-		h.Set("X-OpenAI-Fedramp", "true")
-	case "", "false", "0", "null":
-	default:
-		return nil, invalid
-	}
-	if cred.UA != "" {
-		if !clientUA.MatchString(cred.UA) || len(cred.UA) > 512 || !headerValue.MatchString(cred.UA) {
-			return nil, gate("IDENTITY", "账号客户端标识无法安全匹配")
+	for _, prompt := range prompts {
+		if len(prompt) == 0 || len(prompt) > 8192 {
+			return gate("INVALID", "账号或题目无效")
 		}
-		h.Set("User-Agent", cred.UA)
 	}
-	return h, nil
+	if a.probeKey == "" {
+		return gate("CONFIG", "检测器未配置 Probe API Key")
+	}
+	row, err := a.accountDetail(ctx, jwt, id)
+	if err != nil {
+		return err
+	}
+	if reason := row.eligibility(time.Now()); reason != "" {
+		return gate("ACCOUNT_UNAVAILABLE", reason)
+	}
+	concurrency := len(prompts)
+	if *row.Limit > 0 {
+		available := *row.Limit - *row.Busy
+		if available <= 0 {
+			return errAccountFull
+		}
+		if available < concurrency {
+			concurrency = available
+		}
+	}
+	batchCtx, cancel := context.WithTimeout(ctx, probeBatchTimeout(a.requestTimeout, len(prompts), concurrency))
+	defer cancel()
+	return a.probeGroupTransaction(batchCtx, jwt, id, func(ctx context.Context) error {
+		var workers sync.WaitGroup
+		sem := make(chan struct{}, concurrency)
+		for index, prompt := range prompts {
+			workers.Add(1)
+			go func(index int, prompt string) {
+				defer workers.Done()
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					if report != nil {
+						report(index, ProbeAnswer{}, httpFailure(ctx, ctx.Err(), "检测 "))
+					}
+					return
+				}
+				requestCtx, requestCancel := context.WithTimeout(ctx, a.requestTimeout)
+				answer, err := a.gatewayProbe(requestCtx, prompt)
+				requestCancel()
+				<-sem
+				if report != nil {
+					report(index, answer, err)
+				}
+			}(index, prompt)
+		}
+		workers.Wait()
+		return nil
+	})
 }
 
 func (a *Adapter) Probe(ctx context.Context, jwt string, id int64, prompt string) (ProbeAnswer, error) {
@@ -609,15 +747,14 @@ func (a *Adapter) Probe(ctx context.Context, jwt string, id int64, prompt string
 	if id <= 0 || len(prompt) == 0 || len(prompt) > 8192 {
 		return empty, gate("INVALID", "账号或题目无效")
 	}
-	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
-	defer cancel()
-	rawID := strconv.FormatInt(id, 10)
-	var row accountData
-	if err := a.call(ctx, "GET", "/admin/accounts/"+rawID, jwt, nil, &row); err != nil {
-		return empty, err
+	if a.probeKey == "" {
+		return empty, gate("CONFIG", "检测器未配置 Probe API Key")
 	}
-	if row.ID != id || row.Name == "" {
-		return empty, gate("ACCOUNT_MISMATCH", "所选账号与 Sub2API 返回值不一致")
+	ctx, cancel := context.WithTimeout(ctx, a.requestTimeout)
+	defer cancel()
+	row, err := a.accountDetail(ctx, jwt, id)
+	if err != nil {
+		return empty, err
 	}
 	if reason := row.eligibility(time.Now()); reason != "" {
 		return empty, gate("ACCOUNT_UNAVAILABLE", reason)
@@ -625,26 +762,94 @@ func (a *Adapter) Probe(ctx context.Context, jwt string, id int64, prompt string
 	if *row.Limit > 0 && *row.Busy >= *row.Limit {
 		return empty, errAccountFull
 	}
-	var data exportData
-	// A missing or empty ids parameter would export all accounts. Construct it from the verified positive ID only.
-	if err := a.call(ctx, "GET", "/admin/accounts/data?ids="+rawID+"&include_proxies=true", jwt, nil, &data); err != nil {
-		return empty, err
+	return a.groupTransaction(ctx, jwt, id, func(ctx context.Context) (ProbeAnswer, error) {
+		return a.gatewayProbe(ctx, prompt)
+	})
+}
+
+func (a *Adapter) gatewayProbe(ctx context.Context, prompt string) (ProbeAnswer, error) {
+	delay := a.retryDelay
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return ProbeAnswer{}, httpFailure(ctx, err, "模型网关 ")
+		}
+		answer, err := a.gatewayProbeOnce(ctx, prompt)
+		var ge *GateError
+		if attempt >= probeMaxAttempts || !errors.As(err, &ge) || ge.Code != "PROBE_NO_ACCOUNT" {
+			return answer, err
+		}
+		// Admin group reads can precede the gateway scheduler's snapshot refresh.
+		// Keep the account attached while retrying only rejected HTTP 503 requests.
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ProbeAnswer{}, httpFailure(ctx, ctx.Err(), "模型网关 ")
+		case <-timer.C:
+		}
+		delay *= 2
 	}
-	if len(data.Accounts) != 1 || data.SkippedShadows != 0 || data.Accounts[0].Name != row.Name || data.Accounts[0].Type != row.Type || data.Accounts[0].Platform != row.Platform {
-		return empty, gate("ACCOUNT_MISMATCH", "所选账号资料已变化或导出条目不唯一")
+}
+
+func (a *Adapter) gatewayProbeOnce(ctx context.Context, prompt string) (ProbeAnswer, error) {
+	payload := map[string]any{
+		"model":        probeModel,
+		"reasoning":    map[string]string{"effort": probeReasoning},
+		"include":      []string{"reasoning.encrypted_content"},
+		"instructions": probeInstruction,
+		"input": []any{map[string]any{
+			"role":    "user",
+			"content": []any{map[string]string{"type": "input_text", "text": prompt}},
+		}},
+		"stream": true,
+		"store":  false,
 	}
-	if data.Accounts[0].Rules.CodexCLIOnly {
-		return empty, gate("ACCOUNT_UNAVAILABLE", "账号设置为仅允许 Codex 官方客户端")
-	}
-	proxy, err := data.proxy(row)
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return empty, err
+		return ProbeAnswer{}, gate("INVALID", "请求格式无效")
 	}
-	headers, err := requestHeaders(row, data.Accounts[0].Cred, time.Now())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.gateway+"/v1/responses", strings.NewReader(string(body)))
 	if err != nil {
-		return empty, err
+		return ProbeAnswer{}, gate("CONFIG", "Sub2API 地址无效")
 	}
-	return a.probeWithCodex(ctx, headers, proxy, prompt)
+	req.Header.Set("Authorization", "Bearer "+a.probeKey)
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.gatewayClient.Do(req)
+	if err != nil {
+		return ProbeAnswer{}, httpFailure(ctx, err, "模型网关 ")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		switch resp.StatusCode {
+		case http.StatusUnauthorized:
+			return ProbeAnswer{}, gate("PROBE_KEY_INVALID", "Probe API Key 无效或已失效")
+		case http.StatusForbidden:
+			return ProbeAnswer{}, gate("PROBE_FORBIDDEN", "Probe 分组或 API Key 无权访问模型网关")
+		case http.StatusTooManyRequests:
+			return ProbeAnswer{}, gate("PROBE_LIMIT", "Probe 分组请求过于频繁，请稍后重试")
+		case http.StatusServiceUnavailable:
+			return ProbeAnswer{}, gate("PROBE_NO_ACCOUNT", "Probe 分组当前没有可用账号，模型请求返回 HTTP 503")
+		case http.StatusBadRequest:
+			return ProbeAnswer{}, upstreamBadRequest(resp)
+		default:
+			return ProbeAnswer{}, gate("UPSTREAM_HTTP", fmt.Sprintf("模型网关返回 HTTP %d", resp.StatusCode))
+		}
+	}
+	answer, err := readProbeStream(resp.Body)
+	if err != nil {
+		return ProbeAnswer{}, err
+	}
+	if answer.RequestID == "" {
+		for _, key := range []string{"X-Request-Id", "Request-Id"} {
+			id := resp.Header.Get(key)
+			if strings.HasPrefix(id, "req_") && len(id) <= 128 && headerValue.MatchString(id) {
+				answer.RequestID = id
+				break
+			}
+		}
+	}
+	return answer, nil
 }
 
 // Provider messages sometimes echo input or credentials. Classify them locally and

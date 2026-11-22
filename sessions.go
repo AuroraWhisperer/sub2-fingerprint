@@ -16,16 +16,17 @@ import (
 )
 
 const rememberPeriod = 7 * 24 * time.Hour
-const cookieName = "s2fp_session"
+const cookieName = "s2fp_sub2_session"
+const externalSessionPeriod = 30 * time.Minute
 
 type session struct {
-	mu                            sync.Mutex // Sub2API rotates refresh tokens. One request at a time may refresh or log out this session.
-	key, csrf, jwt, refresh, temp string
-	owner                         int64
-	end, accessEnd                time.Time
-	remember, verified, dirty     bool
-	ctx                           context.Context
-	cancel                        context.CancelFunc
+	mu                                  sync.Mutex // Sub2API rotates refresh tokens. One request at a time may refresh or log out this session.
+	key, csrf, jwt, refresh, temp       string
+	owner                               int64
+	end, accessEnd                      time.Time
+	remember, verified, dirty, external bool
+	ctx                                 context.Context
+	cancel                              context.CancelFunc
 }
 
 type savedSession struct {
@@ -39,6 +40,71 @@ type savedSession struct {
 func cookieKey(value string) string {
 	digest := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(digest[:])
+}
+
+func bearerToken(value string) string {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(value, prefix) {
+		return ""
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(value, prefix))
+	if !panelToken(token) {
+		return ""
+	}
+	return token
+}
+
+func (a *app) sharedAuthFailure(w http.ResponseWriter, err error) bool {
+	if invalidLogin(err) || err == accessExpired {
+		fail(w, http.StatusUnauthorized, "SUB2_SESSION", "请先登录 Sub2API 管理员账号")
+		return false
+	}
+	fail(w, http.StatusServiceUnavailable, "SUB2_SESSION_RETRY", "暂时无法核对 Sub2API 管理员会话，请稍后重试")
+	return false
+}
+
+func (a *app) attachExternal(w http.ResponseWriter, ctx context.Context, token string) (*session, bool) {
+	owner, err := a.api.CurrentAdmin(ctx, token)
+	if err != nil {
+		a.sharedAuthFailure(w, err)
+		return nil, false
+	}
+	s, ok := a.replace(w, nil, LoginResult{
+		JWT:       token,
+		UserID:    owner,
+		Admin:     true,
+		ExpiresIn: int(externalSessionPeriod / time.Second),
+	}, false)
+	if ok {
+		s.external = true
+	}
+	return s, ok
+}
+
+func (a *app) bindExternal(ctx context.Context, s *session, token string) error {
+	if s.external && s.jwt == token && time.Now().Before(s.accessEnd) {
+		return nil
+	}
+	owner, err := a.api.CurrentAdmin(ctx, token)
+	if err != nil {
+		return err
+	}
+	if s.remember {
+		if err := a.forgetSavedLogin(s); err != nil {
+			return gate("SESSION_STORE", "本机暂时无法清除旧登录状态，请重试")
+		}
+	}
+	s.jwt = token
+	s.refresh = ""
+	s.temp = ""
+	s.owner = owner
+	s.accessEnd = time.Now().Add(externalSessionPeriod)
+	s.end = time.Now().Add(externalSessionPeriod)
+	s.remember = false
+	s.verified = true
+	s.dirty = false
+	s.external = true
+	return nil
 }
 
 func (a *app) loadLogins() error {
@@ -127,6 +193,17 @@ func (a *app) saveLogin(s *session) error {
 		return closeErr
 	}
 	if err = os.Rename(tmp, filepath.Join(a.stateDir, s.key+".session")); err != nil {
+		return err
+	}
+	return syncDir(a.stateDir)
+}
+
+func (a *app) forgetSavedLogin(s *session) error {
+	if !s.remember || s.owner <= 0 {
+		return nil
+	}
+	err := os.Remove(filepath.Join(a.stateDir, s.key+".session"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return syncDir(a.stateDir)
@@ -246,6 +323,9 @@ func (a *app) replace(w http.ResponseWriter, old *session, info LoginResult, rem
 }
 
 func (a *app) authorize(ctx context.Context, s *session) error {
+	if s.external {
+		return nil
+	}
 	if s.owner <= 0 || !s.remember {
 		return nil
 	}

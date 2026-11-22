@@ -17,9 +17,6 @@ from urllib.parse import urlsplit
 
 NAME = 'sub2-fingerprint'
 ROOT = Path('/opt') / NAME
-RUNTIME = ROOT.with_name(NAME + '-runtime')
-RUNTIME_BINARY = 'codex-app-server'
-RUNTIME_MARKER = 'runtime-manifest.json'
 UNIT = Path('/etc/systemd/system') / (NAME + '.service')
 SOCKET = UNIT.with_suffix('.socket')
 STATE = Path('/var/lib') / NAME
@@ -29,9 +26,14 @@ BUNDLE = Path(__file__).resolve().parent
 ENTRY = {NAME: 'bin/' + NAME, 'VERSION': 'VERSION', 'DEPLOYMENT.md': 'docs/DEPLOYMENT.md',
          'uninstall.sh': 'uninstall.sh', 'deploy.py': 'deploy.py', 'update.sh': 'update.sh',
          'update.py': 'update.py', 'units/' + UNIT.name: 'docs/' + UNIT.name,
-         'units/' + SOCKET.name: 'docs/' + SOCKET.name}
+         'units/' + SOCKET.name: 'docs/' + SOCKET.name,
+         'units/' + NAME + '-update.path': 'docs/' + NAME + '-update.path',
+         'units/' + NAME + '-update.service': 'docs/' + NAME + '-update.service'}
 PORT = 17861
 RUN_FILE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(json|partial)')
+
+def update_units():
+    return tuple(UNIT.with_name(NAME + '-update.' + suffix) for suffix in ('path', 'service'))
 
 def require(ok, msg):
     if not ok:
@@ -58,30 +60,6 @@ def root_owned(path, disallowed_mode=0o022):
 def file_id(path):
     st = path.stat()
     return [st.st_dev, st.st_ino]
-
-def runtime_manifest(directory, executables):
-    return {'format': 1, 'owner': NAME, 'install': file_id(ROOT),
-            'directory': file_id(directory), 'executables': executables}
-
-def verify_runtime():
-    if not os.path.lexists(RUNTIME):
-        return None
-    require(RUNTIME.is_dir() and RUNTIME.resolve() == RUNTIME and root_owned(RUNTIME.parent) and
-            root_owned(RUNTIME) and not mounts_inside(RUNTIME), '运行时目录归属或挂载不符，已保留')
-    require({p.name for p in RUNTIME.iterdir()} == {RUNTIME_BINARY, RUNTIME_MARKER},
-            '运行时目录包含未知文件或缺少归属标记，已保留')
-    binary, marker = RUNTIME / RUNTIME_BINARY, RUNTIME / RUNTIME_MARKER
-    for path in (marker, binary):
-        require(regular(path) and root_owned(path) and path.stat().st_nlink == 1,
-                '运行时文件的归属或链接不符，已保留')
-    require(marker.stat().st_size < 4096, '运行时归属标记无效')
-    meta = json.loads(marker.read_text('utf-8'))
-    records = meta.get('executables') if isinstance(meta, dict) else None
-    require(isinstance(records, list) and 1 <= len(records) <= 2 and meta == runtime_manifest(RUNTIME, records),
-            '运行时目录与本次安装不匹配，已保留')
-    current = {'inode': file_id(binary), 'sha256': digest(binary)}
-    require(current in records, '运行时程序的身份或内容已更改，已保留')
-    return current
 
 def safe_base(value):
     require(value and not any(c.isspace() or ord(c) < 32 for c in value), 'Sub2 地址无效')
@@ -206,6 +184,8 @@ def preflight():
     vacant(STATE)
     unused_unit(UNIT)
     unused_unit(SOCKET)
+    for unit in update_units():
+        unused_unit(unit)
     require(identity() == (None, None), '已有同名用户或组')
     check_port()
     total, avail = memory_mib()
@@ -244,7 +224,16 @@ def remove_new_tree():
     require(ROOT.resolve() == ROOT and not mounts_inside(ROOT), '安装目录出现符号链接或挂载，已保留')
     shutil.rmtree(ROOT)
 
-def perform_install(base, files):
+def safe_probe_key(value):
+    require(value and len(value) <= 32 << 10 and not any(c.isspace() or ord(c) < 32 for c in value),
+            'Probe API Key 无效')
+    return value
+
+def safe_group_name(value):
+    require(value and len(value) <= 128 and value.strip() == value, 'Probe 分组名称无效')
+    return value
+
+def perform_install(base, probe_key, probe_group_name, files):
     shell = shutil.which('nologin', path='/usr/sbin:/sbin:/usr/bin:/bin')
     require(shell, '找不到 nologin shell')
     with contextlib.ExitStack() as undo:
@@ -262,18 +251,22 @@ def perform_install(base, files):
             os.chmod(path, 0o755 if src in (NAME, 'uninstall.sh', 'update.sh') else 0o644)
         (ROOT / 'config').mkdir(0o755)
         cf = ROOT / 'config/config.json'
-        jwrite(cf, {'sub2_url': base, 'parallel': 3, 'listen': f'127.0.0.1:{PORT}', 'data_dir': str(RUNS)}, 0o640)
+        jwrite(cf, {'sub2_url': base, 'parallel': 1, 'listen': f'127.0.0.1:{PORT}',
+                    'data_dir': str(RUNS), 'probe_api_key': probe_key,
+                    'probe_group_name': probe_group_name}, 0o640)
         os.chown(cf, 0, group.gr_gid)
         state = create_state(user.pw_uid, group.gr_gid)
         undo.callback(remove_state, state, user.pw_uid, group.gr_gid)
         service = ROOT / files['units/' + UNIT.name]
         listener = ROOT / files['units/' + SOCKET.name]
+        update_sources = [(ROOT / files['units/' + unit.name], unit) for unit in update_units()]
         jwrite(MARKER, {'format': 2, 'root': str(ROOT), 'dev': ROOT.stat().st_dev, 'ino': ROOT.stat().st_ino,
                         'uid': user.pw_uid, 'gid': group.gr_gid, 'service': str(UNIT), 'state': state,
                         'unit_sha256': digest(service), 'socket_sha256': digest(listener),
+                        'update_units': {target.name: digest(source) for source, target in update_sources},
                         'files': sorted(set(files.values()) | {'config/config.json', MARKER.name})})
-        run('systemd-analyze', '--man=no', 'verify', str(service), str(listener))
-        for source, target in ((service, UNIT), (listener, SOCKET)):
+        run('systemd-analyze', '--man=no', 'verify', str(service), str(listener), *(str(source) for source, _ in update_sources))
+        for source, target in [(service, UNIT), (listener, SOCKET), *update_sources]:
             with source.open('rb') as inp, target.open('xb') as out:
                 undo.callback(target.unlink)
                 shutil.copyfileobj(inp, out)
@@ -281,6 +274,8 @@ def perform_install(base, files):
         run('systemctl', 'daemon-reload')
         undo.callback(run, 'systemctl', 'disable', '--now', SOCKET.name, check=False)
         run('systemctl', 'enable', '--now', SOCKET.name)
+        undo.callback(run, 'systemctl', 'disable', '--now', update_units()[0].name, check=False)
+        run('systemctl', 'enable', '--now', update_units()[0].name)
         undo.pop_all()
     print('安装完成，回环 socket 已监听。首次访问会启动检测器。')
 
@@ -305,6 +300,9 @@ def verify_manifest():
     if meta['format'] == 2:
         units.append((SOCKET, meta['socket_sha256']))
         state_identity(meta['state'], meta['uid'], meta['gid'])
+    update_hashes = meta.get('update_units', {})
+    require(not update_hashes or set(update_hashes) == {u.name for u in update_units()}, '更新服务清单无效')
+    units.extend((u, update_hashes[u.name]) for u in update_units() if u.name in update_hashes)
     for unit, checksum in units:
         require(regular(unit) and root_owned(unit) and digest(unit) == checksum and
                 system_property('FragmentPath', unit) == str(unit) and not system_property('DropInPaths', unit),
@@ -344,21 +342,23 @@ def uninstall(opts):
     meta = verify_manifest()
     require(meta['format'] == 2, '旧安装请使用原版本自带的卸载器')
     check_state_contents()
-    runtime = verify_runtime()
     if opts.check:
-        print('已核对目录、可选运行时、账号及两个 systemd 单元。')
+        print('已核对目录、账号及 systemd 单元。')
         return
+    if meta.get('update_units'):
+        watcher, worker = update_units()
+        run('systemctl', 'disable', '--now', watcher.name)
+        run('systemctl', 'stop', worker.name)
+        run('systemctl', 'clean', '--what=runtime', worker.name)
     run('systemctl', 'disable', '--now', SOCKET.name)
     run('systemctl', 'stop', UNIT.name)
     verify_manifest()
-    require(verify_runtime() == runtime, '运行时在卸载期间发生变化，已保留')
-    if runtime:
-        (RUNTIME / RUNTIME_BINARY).unlink()
-        (RUNTIME / RUNTIME_MARKER).unlink()
-        RUNTIME.rmdir()
     remove_state(meta['state'], meta['uid'], meta['gid'])
     SOCKET.unlink()
     UNIT.unlink()
+    for unit in update_units():
+        if unit.name in meta.get('update_units', {}):
+            unit.unlink()
     run('systemctl', 'daemon-reload')
     drop_user()
     drop_group()
@@ -371,12 +371,16 @@ def main():
     modes = parser.add_subparsers(dest='op', required=True)
     ins = modes.add_parser('install')
     ins.add_argument('--sub2-url', required=True)
+    ins.add_argument('--probe-api-key', required=True)
+    ins.add_argument('--probe-group-name', default='Probe')
     ins.add_argument('--check', action='store_true')
     un = modes.add_parser('uninstall')
     un.add_argument('--check', action='store_true')
     args = parser.parse_args()
     if args.op == 'install':
         base = safe_base(args.sub2_url)
+        probe_key = safe_probe_key(args.probe_api_key)
+        probe_group_name = safe_group_name(args.probe_group_name)
         files = bundle_files(BUNDLE)
         check_arch(BUNDLE / NAME)
         preflight()
@@ -384,7 +388,7 @@ def main():
             print('安装预检通过。')
             return
         require(os.geteuid() == 0, '安装需要 sudo 权限')
-        perform_install(base, files)
+        perform_install(base, probe_key, probe_group_name, files)
     else:
         require(os.geteuid() == 0, '核对归属和清理需要 sudo 权限')
         with maintenance_lock():

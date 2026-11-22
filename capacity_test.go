@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,7 +11,7 @@ func TestCapacityUsesSub2Counts(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		used     int
-		limit    any
+		limit    int
 		eligible bool
 		canSend  bool
 	}{
@@ -21,57 +19,39 @@ func TestCapacityUsesSub2Counts(t *testing.T) {
 		{"at limit", 20, 20, true, false},
 		{"above a newly reduced limit", 21, 20, true, false},
 		{"unlimited", 5, 0, true, true},
-		{"missing limit", 0, nil, false, false},
+		{"missing limit", 0, 0, false, false},
 		{"missing usage", -1, 20, false, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			var exports atomic.Int32
-			account := map[string]any{"id": 7, "name": "fixture", "platform": "openai", "type": "oauth", "status": "active", "schedulable": true}
-			if test.limit != nil {
-				account["concurrency"] = test.limit
+			f := newProbeFixture(t, []int64{2})
+			f.busy = test.used
+			f.limit = test.limit
+			f.schedulable = test.eligible
+			if test.name == "missing usage" {
+				f.busy = -1
 			}
-			if test.used >= 0 {
-				account["current_concurrency"] = test.used
-			}
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case "/api/v1/admin/accounts":
-					mockOK(w, map[string]any{"page": 1, "pages": 1, "items": []any{account}})
-				case "/api/v1/admin/accounts/7":
-					mockOK(w, account)
-				case "/api/v1/admin/accounts/data":
-					exports.Add(1)
-					mockOK(w, map[string]any{"accounts": []any{}})
-				default:
-					t.Errorf("unexpected path %s", r.URL.Path)
-					http.NotFound(w, r)
-				}
-			}))
-			defer srv.Close()
-			a, err := NewAdapter(srv.URL)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rows, err := a.List(context.Background(), "fixture")
+			rows, err := f.adapter.List(context.Background(), "admin-fixture")
 			if err != nil || len(rows) != 1 || rows[0].Eligible != test.eligible {
 				t.Fatalf("list returned %+v, %v", rows, err)
 			}
 			if test.eligible && (*rows[0].Used != test.used || *rows[0].Limit != test.limit) {
 				t.Fatal("capacity display differs from Sub2API", rows[0])
 			}
-			_, err = a.Probe(context.Background(), "fixture", 7, "test")
+			_, err = f.adapter.Probe(context.Background(), "admin-fixture", 1, "test")
 			switch {
 			case test.canSend:
-				assertGate(t, err, "ACCOUNT_MISMATCH") // Reached export, then stopped at the empty fixture.
+				if err != nil {
+					t.Fatalf("eligible account was not probed: %v", err)
+				}
 			case test.eligible:
 				if err != errAccountFull {
-					t.Fatalf("expected pre-export wait, got %v", err)
+					t.Fatalf("expected pre-probe wait, got %v", err)
 				}
 			default:
 				assertGate(t, err, "ACCOUNT_UNAVAILABLE")
 			}
-			if (exports.Load() > 0) != test.canSend {
-				t.Fatal("unexpected credentials export", exports.Load())
+			if (f.gatewayCalls.Load() > 0) != test.canSend {
+				t.Fatal("unexpected model request", f.gatewayCalls.Load())
 			}
 		})
 	}

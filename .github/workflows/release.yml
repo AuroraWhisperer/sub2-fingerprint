@@ -18,7 +18,7 @@ jobs:
         with:
           go-version-file: .go-version
           cache: false
-      - run: node --test tools/scoring.test.mjs
+      - run: node --test tools/*.test.mjs
       - run: go vet ./... && go test -race ./...
       - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./cmd/detector-launcher
       - run: python3 -m unittest discover -s deploy/tests -p 'test_*.py'

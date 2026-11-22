@@ -46,7 +46,13 @@ func (m *isolatedSub2) Login2FA(_ context.Context, tmp, code string) (LoginResul
 	}
 	return LoginResult{JWT: "mock-second-admin", UserID: 12, Admin: true}, nil
 }
-func (m *isolatedSub2) Logout(context.Context, string) error                { m.logout = true; return nil }
+func (m *isolatedSub2) Logout(context.Context, string) error { m.logout = true; return nil }
+func (m *isolatedSub2) CurrentAdmin(_ context.Context, token string) (int64, error) {
+	if token == "" {
+		return 0, sessionInvalid
+	}
+	return 11, nil
+}
 func (m *isolatedSub2) StepUp(context.Context, string, string) error        { return nil }
 func (m *isolatedSub2) List(context.Context, string) ([]AccountView, error) { return m.listed, nil }
 func (m *isolatedSub2) Probe(ctx context.Context, jwt string, id int64, prompt string) (ProbeAnswer, error) {
@@ -78,6 +84,7 @@ type testBrowser struct {
 	t      *testing.T
 	a      *app
 	cookie *http.Cookie
+	token  string
 	csrf   string
 	epoch  string
 }
@@ -88,6 +95,9 @@ func (b *testBrowser) call(method, path string, body any, origin string) (int, m
 	r := httptest.NewRequest(method, "http://"+b.a.cfg.Listen+path, strings.NewReader(string(bytes)))
 	if b.cookie != nil {
 		r.AddCookie(b.cookie)
+	}
+	if b.token != "" {
+		r.Header.Set("Authorization", "Bearer "+b.token)
 	}
 	if method == "POST" {
 		r.Header.Set("Content-Type", "application/json")
@@ -156,7 +166,7 @@ func waitRun(t *testing.T, q *queue, owner int64, id string) *Run {
 	return nil
 }
 func TestAdminSessionAndBoundedBatch(t *testing.T) {
-	a, m := testAppWithParallel(t, 3)
+	a, m := testAppWithParallel(t, 1)
 	m.listed = append(m.listed, AccountView{ID: 404, Name: "account four", Eligible: true})
 	b := testBrowser{t: t, a: a}
 	if c, _, _ := b.call("GET", "/api/accounts", nil, ""); c != 401 {
@@ -176,17 +186,13 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 		t.Fatal("reused anonymous session")
 	}
 	qs := a.groups[0]
-	req := RunRequest{Epoch: b.epoch, ID: "1eee2222-0000-4000-8000-000000000001", Parallel: 3, Accounts: []int64{101, 202, 303, 404}, Questions: []string{qs[0].ID, qs[1].ID}}
+	req := RunRequest{Epoch: b.epoch, ID: "1eee2222-0000-4000-8000-000000000001", Parallel: 1, Accounts: []int64{101, 202, 303, 404}, Questions: []string{qs[0].ID, qs[1].ID}}
 	if c, _, txt := b.post("/api/runs", req); c != 202 {
 		t.Fatal(c, txt)
 	}
-	waiting := map[int64]bool{101: true, 202: true, 303: true}
-	for range 3 {
-		id := waitStart(t, m)
-		if !waiting[id] {
-			t.Fatalf("unexpected account %d in first three probes", id)
-		}
-		delete(waiting, id)
+	first := waitStart(t, m)
+	if first != 101 && first != 202 && first != 303 && first != 404 {
+		t.Fatalf("unexpected account %d in first probe", first)
 	}
 	pending, err := a.queue.get(11, req.ID)
 	if err != nil {
@@ -198,8 +204,8 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 			t.Fatal("each selected account and challenge must have a unique code before dispatch")
 		}
 		codes[row.RequestID] = fmt.Sprintf("%d/%s", row.AccountID, row.QuestionID)
-		if row.AccountID == 404 && row.Status != "queued" {
-			t.Fatal("fourth account started before a slot was free")
+		if row.AccountID != first && row.Status != "queued" {
+			t.Fatalf("account %d started before serial slot was free", row.AccountID)
 		}
 	}
 	if c, _, _ := b.post("/api/runs", req); c != 200 {
@@ -224,7 +230,7 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 		}
 	}
 	m.mu.Lock()
-	if m.peakActive != 3 || m.calls[101] != 2 || m.calls[202] != 2 || m.calls[303] != 2 || m.calls[404] != 2 {
+	if m.peakActive != 1 || m.calls[101] != 2 || m.calls[202] != 2 || m.calls[303] != 2 || m.calls[404] != 2 {
 		t.Errorf("unexpected upstream calls %v, peak %d", m.calls, m.peakActive)
 	}
 	m.mu.Unlock()
@@ -242,6 +248,26 @@ func TestAdminSessionAndBoundedBatch(t *testing.T) {
 	b.post("/api/login2fa", map[string]string{"code": "123456"})
 	if c, _, _ := b.call("GET", "/api/runs/"+req.ID, nil, ""); c != 404 {
 		t.Fatal("history owner mismatch")
+	}
+}
+
+func TestSub2BrowserSessionBridgeDoesNotLogOutSub2(t *testing.T) {
+	a, m := testApp(t)
+	b := testBrowser{t: t, a: a, token: "browser-access-token"}
+	if code, out, _ := b.call("GET", "/api/session", nil, ""); code != 200 || out["logged_in"] != true {
+		t.Fatalf("browser session was not bridged: code=%d out=%v", code, out)
+	}
+	if code, _, _ := b.call("GET", "/api/accounts", nil, ""); code != 200 {
+		t.Fatalf("bridged session could not list accounts: %d", code)
+	}
+	if code, _, _ := b.post("/api/logout", map[string]any{}); code != 200 {
+		t.Fatalf("local logout failed: %d", code)
+	}
+	if m.logout {
+		t.Fatal("ModelTrace logout revoked the Sub2API session")
+	}
+	if code, out, _ := b.call("GET", "/api/session", nil, ""); code != 200 || out["logged_in"] != true {
+		t.Fatalf("browser session was not reattached after local logout: code=%d out=%v", code, out)
 	}
 }
 func TestSelectedChallengeNumbersSurviveReopening(t *testing.T) {
@@ -286,7 +312,7 @@ func TestSelectedChallengeNumbersSurviveReopening(t *testing.T) {
 	}
 }
 func TestConfiguredParallelLimits(t *testing.T) {
-	for _, limit := range []int{1, 2, 3} {
+	for _, limit := range []int{1} {
 		t.Run(fmt.Sprintf("limit_%d", limit), func(t *testing.T) {
 			a, m := testAppWithParallel(t, limit)
 			b := testBrowser{t: t, a: a}
@@ -305,9 +331,11 @@ func TestConfiguredParallelLimits(t *testing.T) {
 			}
 		})
 	}
-	cfg := settings{Listen: "127.0.0.1:17861", Data: t.TempDir(), Parallel: 4}
-	if _, err := newApp(cfg, newIsolatedSub2()); err == nil {
-		t.Fatal("accepted server configuration with parallel 4")
+	for _, invalid := range []int{0, 2, 4} {
+		cfg := settings{Listen: "127.0.0.1:17861", Data: t.TempDir(), Parallel: invalid}
+		if _, err := newApp(cfg, newIsolatedSub2()); err == nil {
+			t.Fatalf("accepted server configuration with parallel %d", invalid)
+		}
 	}
 }
 

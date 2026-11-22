@@ -25,15 +25,6 @@ REPO = 'AuroraWhisperer/sub2-fingerprint'
 API = 'https://api.github.com/repos/' + REPO + '/releases/latest'
 ARCHIVE_LIMIT = 64 << 20
 PLAIN_LIMIT = 96 << 20
-RUNTIME_TAG = 'rust-v0.164.0'
-# Compressed length and SHA-256 from the upstream release, then the expanded ELF length and SHA-256.
-RUNTIME_ASSETS = {
-    'x86_64': (63228493, '7aefc55b1f0e31cabe2d02fa02c969d8b1602c97d239b2fe6ba82660567b84c3',
-               238625528, '27e9426359a5b34b8de3c10efd60765924929b6a61ea8d2b8b4e05c00abad6bc'),
-    'aarch64': (59458822, 'dcad6259185a33872d28788f17c9387d5ccb1b7136342ee3e14d2aba372dc4d7',
-                207805160, 'b24c7d899435ae236dac6f39a10cfb87effd207fcf805571cbd1c2b854cb11e2'),
-}
-SYSTEM_ZSTD = '/usr/bin/zstd'
 
 def version(value):
     m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', value.strip())
@@ -102,61 +93,6 @@ def acquire(src, target, sha, size=None):
             h.update(block)
             out.write(block)
     d.require(h.hexdigest() == sha and (size is None or count == size), '整包 SHA256 或长度不匹配')
-
-def expand_runtime(archive, binary, expected_size, expected_sha):
-    # acquire() has already verified the exact compressed input. The official frames use an 8 MiB window.
-    with archive.open('rb') as inp, binary.open('xb') as out:
-        result = subprocess.run([SYSTEM_ZSTD, '-qdc', '-M16MB'], stdin=inp, stdout=out,
-                                stderr=subprocess.PIPE, timeout=300)
-        d.require(result.returncode == 0, '官方运行时 zstd 解压失败')
-        d.require(out.tell() == expected_size, '运行时解压后的长度不匹配')
-        os.chmod(binary, 0o755)
-        os.fsync(out.fileno())
-    d.require(d.digest(binary) == expected_sha, '运行时解压后的 SHA256 不匹配')
-
-def install_runtime():
-    arch = platform.machine()
-    d.require(arch in RUNTIME_ASSETS, '官方运行时支持 x86_64 和 aarch64 Linux')
-    size, sha, plain_size, plain_sha = RUNTIME_ASSETS[arch]
-    current = d.verify_runtime()
-    if current and current['sha256'] == plain_sha:
-        print('已安装并校验官方 Codex 运行时', RUNTIME_TAG)
-        return
-    if not current:
-        d.vacant(d.RUNTIME)
-    d.require(os.access(SYSTEM_ZSTD, os.X_OK), '请先安装系统 zstd 命令（/usr/bin/zstd）')
-    required = size + plain_size + (1 << 20)
-    d.require(shutil.disk_usage(d.RUNTIME.parent).free >= required,
-              f'安装官方运行时需要 /opt 至少有 {(required + (1 << 20) - 1) >> 20} MiB 可用磁盘')
-    name = f'codex-app-server-{arch}-unknown-linux-musl.zst'
-    url = f'https://github.com/openai/codex/releases/download/{RUNTIME_TAG}/{name}'
-    with tempfile.TemporaryDirectory(prefix='.sub2-fingerprint-runtime-', dir=d.RUNTIME.parent) as tmp:
-        scratch = Path(tmp)
-        archive = scratch / name
-        with http(url) as src:
-            acquire(src, archive, sha, size)
-        stage = scratch / 'runtime'
-        stage.mkdir()
-        os.chmod(stage, 0o755)
-        binary = stage / d.RUNTIME_BINARY
-        expand_runtime(archive, binary, plain_size, plain_sha)
-        d.check_arch(binary)
-        new = {'inode': d.file_id(binary), 'sha256': plain_sha}
-        marker = stage / d.RUNTIME_MARKER
-        if current:
-            d.require(d.verify_runtime() == current, '下载期间运行时发生变化，已保留')
-            # Register both inodes before switching. An interrupted rename leaves a verifiable executable.
-            d.jwrite(marker, d.runtime_manifest(d.RUNTIME, [current, new]), 0o600)
-            os.replace(marker, d.RUNTIME / d.RUNTIME_MARKER)
-            d.sync_dir(d.RUNTIME)
-            os.replace(binary, d.RUNTIME / d.RUNTIME_BINARY)
-            d.sync_dir(d.RUNTIME)
-        else:
-            d.jwrite(marker, d.runtime_manifest(stage, [new]), 0o600)
-            d.vacant(d.RUNTIME)
-            os.rename(stage, d.RUNTIME)
-            d.sync_dir(d.RUNTIME.parent)
-    print('已安装并校验官方 Codex 运行时', RUNTIME_TAG, str(d.RUNTIME / d.RUNTIME_BINARY))
 
 def unpack(archive, root):
     """Only create ordinary files and directories. Permissions come from our own installer."""
@@ -232,7 +168,7 @@ class NoRedirect(request.HTTPRedirectHandler):
     def redirect_request(self, *args):
         return None
 
-def snapshot(folder, meta, files, active, enabled, socket_sum):
+def snapshot(folder, meta, files, active, enabled, socket_sum, update_sums):
     # Publish a complete rollback record before changing any installed file.
     with tempfile.TemporaryDirectory(prefix='.sub2-fingerprint-backup-', dir=d.ROOT.parent) as tmp:
         stage = Path(tmp) / 'snapshot'
@@ -247,8 +183,15 @@ def snapshot(folder, meta, files, active, enabled, socket_sum):
         shutil.copy2(d.UNIT, stage / 'old.service')
         if meta['format'] == 2:
             shutil.copy2(d.SOCKET, stage / 'old.socket')
+        for unit in d.update_units():
+            if unit.name in meta.get('update_units', {}):
+                shutil.copy2(unit, stage / ('old.' + unit.name))
+        watcher = d.update_units()[0]
         journal = {'dev': meta['dev'], 'ino': meta['ino'], 'active': active, 'enabled': enabled,
                    'socket_sum': socket_sum,
+                   'update_sums': update_sums,
+                   'watcher_active': running(watcher) if meta.get('update_units') else False,
+                   'watcher_enabled': d.system_property('UnitFileState', watcher) == 'enabled' if meta.get('update_units') else False,
                    'previous': sorted(previous), 'new': sorted(set(files.values()) - previous)}
         d.jwrite(stage / 'journal.json', journal, 0o600)
         if os.name == 'posix':
@@ -279,6 +222,14 @@ def recover(folder):
         return
     old = json.loads((folder / 'old' / d.MARKER.name).read_text())
     legacy = old['format'] == 1
+    for unit in d.update_units():
+        if os.path.lexists(unit):
+            d.require(d.regular(unit) and d.digest(unit) in
+                      (old.get('update_units', {}).get(unit.name), j.get('update_sums', {}).get(unit.name)),
+                      '恢复时发现来源不明的更新单元：' + unit.name)
+    watcher = d.update_units()[0]
+    if watcher.exists():
+        d.run('systemctl', 'disable', '--now', watcher.name)
     for name in j['previous'] + j['new']:
         safe = name in d.ENTRY.values() or name == d.MARKER.name or name.startswith('LICENSES/')
         dest = d.ROOT / name
@@ -310,7 +261,16 @@ def recover(folder):
             d.remove_state(json.loads(state_mark.read_text()), old['uid'], old['gid'])
     else:
         atomic_install(folder / 'old.socket', d.SOCKET, 0o644)
+    for unit in d.update_units():
+        if unit.name in old.get('update_units', {}):
+            atomic_install(folder / ('old.' + unit.name), unit, 0o644)
+        elif unit.exists():
+            unit.unlink()
     d.run('systemctl', 'daemon-reload')
+    if old.get('update_units'):
+        enable_as(watcher, j['watcher_enabled'])
+        if j['watcher_active']:
+            d.run('systemctl', 'start', watcher.name)
     restored = d.UNIT if legacy else d.SOCKET
     enable_as(restored, j['enabled'])
     if j['active']:
@@ -339,10 +299,19 @@ def apply(bundle, files, meta, folder):
     enabled = unit_state == 'enabled'
     if legacy:
         preflight_migration(meta)
+    if not meta.get('update_units'):
+        for unit in d.update_units():
+            d.unused_unit(unit)
     service_src, socket_src = ('units/' + unit.name for unit in (d.UNIT, d.SOCKET))
     socket_sum = d.digest(bundle / socket_src)
-    snapshot(folder, meta, files, active, enabled, socket_sum)
+    update_sums = {unit.name: d.digest(bundle / 'units' / unit.name) for unit in d.update_units()}
+    snapshot(folder, meta, files, active, enabled, socket_sum, update_sums)
+    watcher = d.update_units()[0]
+    watcher_enabled = d.system_property('UnitFileState', watcher) == 'enabled' if meta.get('update_units') else True
+    watcher_active = running(watcher) if meta.get('update_units') else True
     try:
+        if meta.get('update_units'):
+            d.run('systemctl', 'stop', watcher.name)
         if legacy:
             state = d.create_state(meta['uid'], meta['gid'])
             try:
@@ -360,7 +329,8 @@ def apply(bundle, files, meta, folder):
             atomic_install(bundle / src, d.ROOT / dest, 0o755 if src in (d.NAME, 'uninstall.sh', 'update.sh') else 0o644)
         unit = d.ROOT / files[service_src]
         listener = d.ROOT / files[socket_src]
-        d.run('systemd-analyze', '--man=no', 'verify', str(unit), str(listener))
+        update_sources = [(d.ROOT / files['units/' + target.name], target) for target in d.update_units()]
+        d.run('systemd-analyze', '--man=no', 'verify', str(unit), str(listener), *(str(source) for source, _ in update_sources))
         atomic_install(unit, d.UNIT, 0o644)
         if legacy:
             with d.SOCKET.open('xb') as out, listener.open('rb') as inp:
@@ -368,7 +338,10 @@ def apply(bundle, files, meta, folder):
             os.chmod(d.SOCKET, 0o644)
         else:
             atomic_install(listener, d.SOCKET, 0o644)
+        for source, target in update_sources:
+            atomic_install(source, target, 0o644)
         updated = dict(meta, format=2, state=state, unit_sha256=d.digest(d.UNIT), socket_sha256=socket_sum,
+                       update_units=update_sums,
                        files=sorted(set(meta['files']) | set(files.values())))
         temp_marker = folder / 'new-manifest.json'
         d.jwrite(temp_marker, updated)
@@ -379,6 +352,9 @@ def apply(bundle, files, meta, folder):
         if active or legacy:
             d.run('systemctl', 'start', d.SOCKET.name)
             health()
+        enable_as(watcher, watcher_enabled)
+        if watcher_active:
+            d.run('systemctl', 'start', watcher.name)
         if legacy:
             d.write_new(folder / 'verified-migration', 'ok', 0o600)
     except BaseException:
@@ -411,14 +387,13 @@ def update(args):
             apply(d.BUNDLE, files, meta, folder)
         return
     d.require(meta['format'] == 2, '请在新版解压目录执行 sudo sh ./install.sh --migrate')
-    if args.install_runtime:
-        install_runtime()
-        return
+    # Older updaters copy the new scripts but omit units absent from their ENTRY.
+    repair_units = not meta.get('update_units')
     newest = None
     if not args.archive:
         newest, url, sha, size = release_info()
         print('已安装', '.'.join(map(str, current)), 'GitHub 最新', '.'.join(map(str, newest)))
-        if newest <= current or args.check:
+        if newest < current or (newest == current and not repair_units) or args.check:
             return
     else:
         d.require(bool(re.fullmatch('[0-9a-fA-F]{64}', args.sha256 or '')), '本地发布包需要提供可信的 --sha256')
@@ -434,10 +409,44 @@ def update(args):
         candidate = file_version(bundle / 'VERSION')
         d.require(newest is None or newest == candidate, '程序版本与 GitHub 发布标签不一致')
         d.require(candidate >= current, '选择的发布版本低于已安装版本')
-        if candidate == current or args.check:
+        if (candidate == current and not repair_units) or args.check:
             print('本地发布包已验证。')
             return
         apply(bundle, files, meta, folder)
+
+def web_status(state):
+    folder = Path('/run/sub2-fingerprint-update')
+    d.require(folder.is_dir() and folder.resolve() == folder and d.root_owned(folder), '更新状态目录无效')
+    fd, name = tempfile.mkstemp(prefix='.status-', dir=folder)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            json.dump({'state': state}, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(name, 0o644)
+        os.replace(name, folder / 'status.json')
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+def web_update(args):
+    trigger = Path('/run/sub2-fingerprint/update.request')
+    d.require(trigger.exists() and not trigger.is_symlink() and trigger.is_file() and trigger.stat().st_size == 0,
+              '未找到有效的页面更新请求')
+    web_status('running')
+    trigger.unlink()
+    try:
+        with d.maintenance_lock():
+            update(args)
+        web_status('done')
+    except BaseException:
+        web_status('failed')
+        raise
+
+def web_finished():
+    status = Path('/run/sub2-fingerprint-update/status.json')
+    if status.exists() and json.loads(status.read_text('utf-8')).get('state') == 'running':
+        web_status('failed')
 
 def main():
     p = argparse.ArgumentParser()
@@ -447,19 +456,25 @@ def main():
     modes = p.add_mutually_exclusive_group()
     modes.add_argument('--check', action='store_true')
     modes.add_argument('--recover', action='store_true')
-    modes.add_argument('--install-runtime', action='store_true', help='安装或更新本版本指定的官方 Codex 运行时')
+    modes.add_argument('--web', action='store_true')
+    modes.add_argument('--web-finished', action='store_true')
     args = p.parse_args()
     d.require(os.geteuid() == 0, '更新需要 sudo 权限')
     d.require(args.migrate or Path(__file__).resolve().parent == d.ROOT, '请调用安装目录里的 update.sh')
     d.require(not args.migrate or not (args.archive or args.sha256), '迁移直接核对当前新版解压包')
-    d.require(not args.install_runtime or not (args.migrate or args.archive or args.sha256),
-              '--install-runtime 请单独运行')
+    d.require(not (args.web or args.web_finished) or not (args.migrate or args.archive or args.sha256), '页面更新不接受自定义参数')
+    if args.web_finished:
+        web_finished()
+        return
+    if args.web:
+        web_update(args)
+        return
     with d.maintenance_lock():
         update(args)
 
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, ValueError, KeyError, d.subprocess.SubprocessError, tarfile.TarError) as exc:
+    except (OSError, ValueError, KeyError, tarfile.TarError, subprocess.SubprocessError) as exc:
         print('更新已停止：', exc, file=sys.stderr)
         sys.exit(1)

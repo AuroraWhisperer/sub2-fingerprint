@@ -1,6 +1,8 @@
-import { el, loadBank, renderRun, date, active } from "./results.js";
+import { el, loadBank, renderRun, active } from "./results.js";
+import { createUpdater } from "./update.js";
 
 const $ = (id) => document.getElementById(id);
+const appRoot = new URL(".", document.baseURI);
 let session = {},
   bank,
   loadingBank = false,
@@ -14,8 +16,10 @@ let session = {},
 let readyAccounts = false,
   readyQuestions = false;
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+const updates = createUpdater(api, updateStart, syncSession);
 const show = (id, yes) => {
-  $(id).hidden = !yes;
+  const node = $(id);
+  if (node) node.hidden = !yes;
 };
 function notice(text = "", error = false) {
   const panel = $("notice");
@@ -24,12 +28,20 @@ function notice(text = "", error = false) {
   panel.classList.toggle("error", error);
 }
 async function api(path, body) {
+  const token = (() => {
+    try {
+      return String(localStorage.getItem("auth_token") || "").trim();
+    } catch {
+      return "";
+    }
+  })();
   const options = {
     credentials: "same-origin",
     cache: "no-store",
     redirect: "error",
     headers: { Accept: "application/json" },
   };
+  if (token) options.headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) {
     options.method = "POST";
     options.headers["Content-Type"] = "application/json";
@@ -38,9 +50,9 @@ async function api(path, body) {
   }
   let response;
   try {
-    response = await fetch(path, options);
+    response = await fetch(new URL(path.replace(/^\/+/, ""), appRoot), options);
   } catch {
-    throw new Error("连接中断，请检查本地 SSH 隧道后刷新。");
+    throw new Error("连接中断，请刷新页面。");
   }
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
@@ -54,7 +66,19 @@ async function api(path, body) {
 }
 async function syncSession() {
   const previous = session;
-  const current = await api("/api/session");
+  let current;
+  try {
+    current = await api("/api/session");
+  } catch (error) {
+    if (error.status === 401 && error.code === "SUB2_SESSION") {
+      session = { logged_in: false };
+      applySession();
+      if (previous.logged_in)
+        notice("登录已失效，请重新登录管理后台。", true);
+      return false;
+    }
+    throw error;
+  }
   if (session !== previous) return false;
   if (
     current.logged_in &&
@@ -67,18 +91,14 @@ async function syncSession() {
   session = current;
   applySession();
   show("reconnect", false);
-  if (
-    (previous.logged_in || previous.needs_2fa) &&
-    !current.logged_in &&
-    !current.needs_2fa
-  )
-    notice("登录已失效，请重新登录。", true);
+  if (previous.logged_in && !current.logged_in)
+    notice("登录已失效，请重新登录管理后台。", true);
   return current.logged_in;
 }
 async function failure(error) {
   notice(error.message || "操作失败，请重试。", true);
   if (String(error.code || "").startsWith("STEP_UP") && session.logged_in) {
-    $("verify").open = true;
+    show("verify", true);
     $("stepForm").elements.code.focus();
   }
   if (
@@ -119,31 +139,10 @@ function action(element, event, job) {
   });
 }
 function applySession() {
-  const expires = session.logged_in && date(session.expires_at);
-  show("sessionInfo", Boolean(expires));
-  $("sessionInfo").textContent = expires
-    ? `${session.remembered ? "此浏览器保持登录至" : "本次登录有效至"} ${expires}`
-    : "";
   show("version", Boolean(session.version));
-  if (session.version)
-    $("version").textContent = `${session.version} · 版本与更新`;
+  if (session.version) $("version").textContent = session.version;
   show("auth", !session.logged_in);
   show("desk", session.logged_in);
-  show("logout", session.logged_in || session.needs_2fa);
-  show("twoForm", !session.logged_in && session.needs_2fa);
-  show("loginForm", !session.logged_in && !session.needs_2fa);
-  $("authTitle").textContent = session.needs_2fa
-    ? "验证管理员身份"
-    : "登录 Sub2API";
-  $("authHint").textContent = session.needs_2fa
-    ? "输入验证器生成的六位验证码。"
-    : "使用管理员账号读取服务器上的 OpenAI 账号。";
-  const parallel = $("parallel");
-  const limit = [2, 3].includes(session.parallel) ? session.parallel : 1;
-  for (const option of parallel.options)
-    option.disabled = Number(option.value) > limit;
-  if (!parallel.value || parallel.selectedOptions[0].disabled)
-    parallel.value = "1";
   if (!session.logged_in) {
     stopPoll();
     ++revision;
@@ -154,6 +153,8 @@ function applySession() {
     readyAccounts = readyQuestions = false;
     for (const id of ["accounts", "questions", "result"])
       $(id).replaceChildren();
+    show("runProgress", false);
+    show("verify", false);
   }
   updateStart();
 }
@@ -162,24 +163,39 @@ const checked = (root) =>
     $(root).querySelectorAll("input:checked:not(:disabled)"),
     (node) => node.value,
   );
+const enabledBoxes = (root) =>
+  Array.from($(root).querySelectorAll("input:not(:disabled)"));
+function syncToggleLabels() {
+  const acctBoxes = enabledBoxes("accounts");
+  const allAccts =
+    acctBoxes.length > 0 && acctBoxes.every((box) => box.checked);
+  $("selectAllAccounts").textContent = allAccts ? "清空" : "全选";
+  $("selectAllAccounts").disabled = acctBoxes.length === 0;
+
+  const qBoxes = enabledBoxes("questions");
+  const allQs = qBoxes.length > 0 && qBoxes.every((box) => box.checked);
+  $("selectAllQuestions").textContent = allQs ? "清空" : "全选";
+  $("selectAllQuestions").disabled = qBoxes.length === 0;
+}
 function updateStart() {
+  updates.setContext(session, runActive);
   const n = checked("accounts").length,
     q = checked("questions").length;
   const start = $("start");
+  syncToggleLabels();
   let reason = "";
-  if (!session.logged_in) reason = "请先登录。";
-  else if (start.hasAttribute("aria-busy")) reason = "正在提交检测，请稍候。";
-  else if (runActive) reason = "本批检测正在进行，结束后即可开始下一批。";
-  else if (!readyAccounts) reason = "账号列表尚未就绪。";
-  else if (!readyQuestions) reason = "挑战题尚未就绪。";
-  else if (!n && !$("accounts").querySelector("input:not(:disabled)"))
-    reason = "当前没有可检测的账号，请刷新账号列表。";
-  else if (!n) reason = "请选择至少一个账号。";
-  else if (n > 24) reason = "每批最多可选 24 个账号。";
-  else if (!q) reason = "请选择至少一道挑战题。";
+  if (!session.logged_in) reason = "未登录";
+  else if (updates.busy) reason = "程序更新中";
+  else if (start.hasAttribute("aria-busy")) reason = "提交中…";
+  else if (runActive) reason = "检测进行中";
+  else if (!readyAccounts || !readyQuestions) reason = "加载中…";
+  else if (!n && !enabledBoxes("accounts").length) reason = "无可用账号";
+  else if (!n) reason = "未选账号";
+  else if (n > 24) reason = "最多选 24 个账号";
+  else if (!q) reason = "未选挑战题";
   start.disabled = Boolean(reason);
   $("estimate").textContent =
-    reason || `本批次最多发送 ${n * q} 次模型请求，使用所选账号的额度。`;
+    reason || `已选 ${n} 账号 · ${q} 题（${n * q} 次请求）`;
 }
 function checkbox(value, checkedValue, disabled) {
   const box = el("input");
@@ -198,49 +214,63 @@ const statusNames = new Map([
 ]);
 async function accounts() {
   readyAccounts = false;
-  $("accountInfo").textContent = "正在读取…";
+  $("accountInfo").textContent = "读取中…";
   updateStart();
   const { accounts: list } = await api("/api/accounts");
   if (!session.logged_in) return;
   const selected = new Set(checked("accounts"));
   const rows = list.map((item) => {
     const row = el("label", null, "choice");
-    const description = el("span");
-    description.append(
+    const main = el("span", null, "choice-main");
+    const titleLine = el("span", null, "choice-title");
+    titleLine.append(
       el("span", item.name || "未命名账号", "name"),
-      el("span", ` · #${item.id}`, "small"),
+      el("span", `#${item.id}`, "acct-id"),
     );
+    main.append(titleLine);
+    if (item.reason) {
+      main.append(el("span", item.reason, "choice-sub"));
+    }
+    const meta = el("span", null, "choice-meta");
     if (
       Number.isInteger(item.current_concurrency) &&
       Number.isInteger(item.concurrency)
     ) {
-      const limit = item.concurrency > 0 ? item.concurrency : "不限";
-      const full = item.eligible && item.concurrency > 0 &&
+      const limit = item.concurrency > 0 ? item.concurrency : "∞";
+      const full =
+        item.eligible &&
+        item.concurrency > 0 &&
         item.current_concurrency >= item.concurrency;
-      const capacity = `容量 ${item.current_concurrency} / ${limit}`;
-      description.append(el("br"), el("span", full ? `${capacity} · 有空位时开始检测` : capacity, "small"));
+      meta.append(
+        el(
+          "span",
+          `${item.current_concurrency}/${limit}`,
+          `cap-badge${full ? " full" : ""}`,
+        ),
+      );
     }
-    if (item.reason)
-      description.append(el("br"), el("span", item.reason, "small"));
     const state = statusNames.get(item.status) || item.status || "未知";
+    meta.append(
+      el("span", state, `state ${item.eligible ? "good" : "bad"}`),
+    );
     row.append(
       checkbox(
         item.id,
         selected.has(String(item.id)) && item.eligible,
         !item.eligible,
       ),
-      description,
-      el("span", state, `state ${item.eligible ? "good" : ""}`),
+      main,
+      meta,
     );
     return row;
   });
   $("accounts").replaceChildren(
     ...(rows.length
       ? rows
-      : [el("p", "当前没有 OpenAI OAuth 账号。", "empty")]),
+      : [el("p", "暂无 OpenAI OAuth 账号。", "empty")]),
   );
-  $("accountInfo").textContent =
-    `${list.filter((item) => item.eligible).length} 个可检测 / 共 ${list.length} 个`;
+  const eligibleCount = list.filter((item) => item.eligible).length;
+  $("accountInfo").textContent = `${eligibleCount}/${list.length} 可用`;
   readyAccounts = true;
   updateStart();
 }
@@ -250,17 +280,12 @@ async function questions() {
   const { questions: list } = await api("/api/questions");
   if (!session.logged_in) return;
   const rows = list.map((item, index) => {
-    const row = el("div", null, "qrow"),
-      choice = el("label", null, "choice");
+    const choice = el("label", null, "q-card");
     choice.append(
       checkbox(item.id, index === 0, false),
       el("span", `挑战 ${item.number ?? index + 1}`, "name"),
-      el("span", `${item.expected_count} 个数字`, "small"),
     );
-    const detail = el("details");
-    detail.append(el("summary", "查看题目"), el("p", item.prompt, "prompt"));
-    row.append(choice, detail);
-    return row;
+    return choice;
   });
   $("questions").replaceChildren(...rows);
   readyQuestions = list.length > 0 && list.length <= 3;
@@ -273,15 +298,24 @@ function selectRun(id, alreadyActive = false) {
   ++revision;
   viewed = id;
   lastRender = "";
-  $("result").replaceChildren(
-    el(
-      "p",
-      id
-        ? "正在读取本次结果…"
-        : "完成检测后，在这里查看每个账号的答案与归因概率。",
-      "empty",
-    ),
-  );
+  if (id && alreadyActive) {
+    $("progressLabel").textContent = "正在发起检测…";
+    $("progressDetail").textContent = "准备中";
+    $("runProgress").dataset.state = "running";
+    $("progressBar").dataset.state = "running";
+    $("progressBar").firstElementChild.style.width = "8%";
+    show("runProgress", true);
+    $("result").replaceChildren();
+  } else {
+    $("result").replaceChildren(
+      el(
+        "p",
+        id ? "正在同步检测结果…" : "选择账号和挑战题后开始检测。",
+        "empty",
+      ),
+    );
+    show("runProgress", false);
+  }
   runActive = alreadyActive;
   updateStart();
   show("cancel", false);
@@ -314,8 +348,9 @@ async function poll(version) {
             row.code === "STEP_UP_REQUIRED" ||
             String(row.error || "").includes("二次验证"),
         )
-      )
-        $("verify").open = true;
+      ) {
+        show("verify", true);
+      }
     }
     runActive = active(run.state);
     updateStart();
@@ -334,14 +369,15 @@ async function poll(version) {
 async function prepareBank() {
   if (bank || loadingBank) return;
   loadingBank = true;
-  $("bankMessage").textContent = "正在加载指纹库，加载完成后会自动计算概率。";
+  $("bankMessage").textContent = "正在加载指纹库…";
   show("bankStatus", true);
   show("retryBank", false);
   try {
     bank = await loadBank();
   } catch (error) {
     $("bankMessage").textContent = error.message?.includes("指纹库")
-      ? error.message : "指纹库下载失败。";
+      ? error.message
+      : "指纹库加载失败。";
     show("retryBank", true);
     return;
   } finally {
@@ -353,11 +389,25 @@ async function prepareBank() {
 }
 async function initialize() {
   show("reconnect", false);
-  session = await api("/api/session");
+  try {
+    session = await api("/api/session");
+  } catch (error) {
+    if (error.status === 401 && error.code === "SUB2_SESSION") {
+      session = { logged_in: false };
+      applySession();
+      return;
+    }
+    throw error;
+  }
   applySession();
   if (!session.logged_in) return;
   void prepareBank();
-  const results = await Promise.allSettled([accounts(), questions(), currentRun()]);
+  const results = await Promise.allSettled([
+    updates.restore(),
+    accounts(),
+    questions(),
+    currentRun(),
+  ]);
   const failed = results.find((r) => r.status === "rejected");
   if (failed) {
     show("reconnect", true);
@@ -368,7 +418,7 @@ function selection() {
   return {
     accounts: checked("accounts").map(Number),
     questions: checked("questions"),
-    parallel: Number($("parallel").value),
+    parallel: 1,
   };
 }
 async function submitRun() {
@@ -376,12 +426,8 @@ async function submitRun() {
   const payload = selection();
   const signature = JSON.stringify(payload);
   if (!(await syncSession())) return;
-  if (payload.parallel !== Number($("parallel").value)) {
-    notice("服务器并发上限已变化，请按当前选项重新开始检测。", true);
-    return;
-  }
   if (runActive) {
-    notice("已有一批检测正在进行，结束后即可开始下一批。");
+    notice("检测进行中，请等待当前批次完成。");
     return;
   }
   if (JSON.stringify(selection()) !== signature) {
@@ -390,7 +436,6 @@ async function submitRun() {
   }
   if (typeof session.epoch !== "string" || !session.epoch)
     throw new Error("无法验证检测服务版本，请刷新页面后重试。");
-  // A retry of an unanswered submit belongs to its original server process.
   if (!pendingSubmit || pendingSubmit.signature !== signature)
     pendingSubmit = {
       id: crypto.randomUUID(),
@@ -407,60 +452,39 @@ async function submitRun() {
     }));
   } catch (error) {
     if (error.status === 409 && error.code === "OLD_RUN")
-      error.message =
-        "检测服务已重启，上次请求不能自动重发。如需新的检测，请再次点击“开始检测”。";
+      error.message = "检测服务已重启，请重新点击“开始检测”。";
     if (error.status && error.status < 500 && error.code !== "CSRF")
       pendingSubmit = null;
     throw error;
   }
   if (pendingSubmit !== attempt) return;
   if (id !== attempt.id)
-    throw new Error("任务编号异常，请刷新本次结果确认是否已经提交。");
+    throw new Error("任务编号异常，请刷新确认是否已提交。");
   pendingSubmit = null;
-  notice("检测已提交。");
   await selectRun(id, true);
 }
-for (const id of ["accounts", "questions", "parallel"])
+for (const id of ["accounts", "questions"])
   $(id).addEventListener("change", updateStart);
-action($("loginForm"), "submit", async () => {
-  // A login form can outlive the anonymous session when the service sleeps.
-  session = await api("/api/session");
-  if (session.logged_in || session.needs_2fa) {
-    await initialize();
-    return;
-  }
-  const form = $("loginForm").elements;
-  const body = {
-    email: form.email.value.trim(),
-    password: form.password.value,
-    remember: form.remember.checked,
-  };
-  form.password.value = "";
-  await api("/api/login", body);
-  await initialize();
-  if (session.needs_2fa) $("twoForm").elements.code.focus();
+$("selectAllAccounts").addEventListener("click", () => {
+  const boxes = enabledBoxes("accounts");
+  const next = !boxes.every((box) => box.checked);
+  for (const box of boxes.slice(0, 24)) box.checked = next;
+  if (!next) for (const box of boxes) box.checked = false;
+  updateStart();
 });
-for (const [id, path] of [
-  ["twoForm", "login2fa"],
-  ["stepForm", "stepup"],
-])
-  action($(id), "submit", async () => {
-    const field = $(id).elements.code,
-      code = field.value;
-    field.value = "";
-    await api(`/api/${path}`, { code });
-    if (id === "twoForm") await initialize();
-    else {
-      $("verify").open = false;
-      notice("二次验证已完成。");
-    }
-  });
-action($("logout"), "click", async () => {
-  await api("/api/logout", {});
-  session = {};
-  applySession();
-  await initialize();
-  notice("已退出。");
+$("selectAllQuestions").addEventListener("click", () => {
+  const boxes = enabledBoxes("questions");
+  const next = !boxes.every((box) => box.checked);
+  for (const box of boxes) box.checked = next;
+  updateStart();
+});
+action($("stepForm"), "submit", async () => {
+  const field = $("stepForm").elements.code,
+    code = field.value;
+  field.value = "";
+  await api("/api/stepup", { code });
+  show("verify", false);
+  notice("二次验证已完成。");
 });
 action($("refreshAccounts"), "click", accounts);
 action($("reloadResults"), "click", currentRun);

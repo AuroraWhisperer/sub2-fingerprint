@@ -34,13 +34,16 @@ var assets embed.FS
 var releaseVersion string
 
 type settings struct {
-	Base     string `json:"sub2_url"`
-	Parallel int    `json:"parallel"`
-	Listen   string `json:"listen"`
-	Data     string `json:"data_dir"`
+	Base           string `json:"sub2_url"`
+	Parallel       int    `json:"parallel"`
+	Listen         string `json:"listen"`
+	Data           string `json:"data_dir"`
+	ProbeAPIKey    string `json:"probe_api_key"`
+	ProbeGroupName string `json:"probe_group_name"`
 }
 type sub2 interface {
 	Refresh(context.Context, string) (LoginResult, error)
+	CurrentAdmin(context.Context, string) (int64, error)
 	VerifyAdmin(context.Context, string, int64) error
 	Login(context.Context, string, string) (LoginResult, error)
 	Login2FA(context.Context, string, string) (LoginResult, error)
@@ -49,12 +52,16 @@ type sub2 interface {
 	List(context.Context, string) ([]AccountView, error)
 	Probe(context.Context, string, int64, string) (ProbeAnswer, error)
 }
+type batchProbe interface {
+	ProbeBatch(context.Context, string, int64, []string, probeBatchReporter) error
+}
 type app struct {
 	stateDir    string
 	epoch       string
 	cfg         settings
 	api         sub2
 	queue       *queue
+	updater     *updater
 	bankVersion string
 	groups      [][]Question
 	questions   map[string]Question
@@ -66,7 +73,7 @@ type app struct {
 }
 
 func newApp(cfg settings, api sub2) (*app, error) {
-	a := &app{cfg: cfg, api: api, questions: map[string]Question{}, sessions: map[string]*session{}}
+	a := &app{cfg: cfg, api: api, updater: newUpdater(), questions: map[string]Question{}, sessions: map[string]*session{}}
 	a.epoch = randomID()
 	a.stateDir = os.Getenv("STATE_DIRECTORY")
 	if a.stateDir == "" {
@@ -108,6 +115,11 @@ func newApp(cfg settings, api sub2) (*app, error) {
 		return nil, err
 	}
 	a.queue, e = openQueue(cfg.Data, a.bankVersion, api.Probe)
+	if e == nil {
+		if batch, ok := api.(batchProbe); ok {
+			a.queue.probeBatch = batch.ProbeBatch
+		}
+	}
 	return a, e
 }
 func respond(w http.ResponseWriter, status int, value any) {
@@ -205,9 +217,36 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s != nil {
 		defer s.mu.Unlock()
 	}
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token != "" {
+		if s == nil {
+			var ok bool
+			s, ok = a.attachExternal(w, r.Context(), token)
+			if !ok {
+				return
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+		} else if err := a.bindExternal(r.Context(), s, token); err != nil {
+			a.sharedAuthFailure(w, err)
+			return
+		}
+	} else if s != nil && s.external {
+		if p == "/api/session" {
+			if err := a.dropLogin(s); err != nil {
+				fail(w, 503, "SESSION_STORE", "无法清除失效的页面会话")
+				return
+			}
+			s = nil
+		} else {
+			fail(w, http.StatusUnauthorized, "SUB2_SESSION", "请先登录 Sub2API 管理员账号")
+			return
+		}
+	}
 	if r.Method == "POST" {
 		mt, _, e := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		if e != nil || mt != "application/json" || r.Header.Get("Origin") != "http://"+r.Host || s == nil || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-CSRF-Token")), []byte(s.csrf)) != 1 {
+		origin := r.Header.Get("Origin")
+		if e != nil || mt != "application/json" || (origin != "http://"+r.Host && origin != "https://"+r.Host) || s == nil || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-CSRF-Token")), []byte(s.csrf)) != 1 {
 			fail(w, 403, "CSRF", "页面会话已过期或来源不符，请刷新")
 			return
 		}
@@ -259,6 +298,8 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch p {
+	case "/api/update", "/api/update/check", "/api/update/install":
+		a.updateRoute(w, r)
 	case "/api/accounts":
 		if !exactMethod(w, r, "GET") {
 			return
@@ -316,7 +357,7 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 		if !ok {
 			return
 		}
-		if s.refresh != "" {
+		if !s.external && s.refresh != "" {
 			if err := a.api.Logout(r.Context(), s.refresh); err != nil {
 				log.Print("local logout completed; remote revocation unconfirmed")
 			}
@@ -416,6 +457,13 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 	respond(w, 200, a.sessionView(st))
 }
 func (a *app) submit(w http.ResponseWriter, r *http.Request, s *session) {
+	a.updater.mu.Lock()
+	defer a.updater.mu.Unlock()
+	update, err := a.updater.status()
+	if err != nil || updateBusy(update) {
+		fail(w, 409, "UPDATE_ACTIVE", "程序正在更新或更新状态无法确认，请稍后再开始检测。")
+		return
+	}
 	var req RunRequest
 	if !decode(w, r, &req) {
 		return
@@ -528,7 +576,10 @@ func run() error {
 	if e := d.Decode(&cfg); e != nil {
 		return errors.New("invalid config JSON")
 	}
-	client, err := NewAdapter(cfg.Base)
+	if cfg.ProbeAPIKey == "" {
+		return gate("CONFIG", "检测器未配置 Probe API Key")
+	}
+	client, err := NewConfiguredAdapter(cfg.Base, cfg.ProbeAPIKey, cfg.ProbeGroupName)
 	if err != nil {
 		return err
 	}

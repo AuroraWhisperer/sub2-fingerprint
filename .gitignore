@@ -1,4 +1,5 @@
 /dist/
+/outputs/
 /bin/
 /config.json
 /config.local.json

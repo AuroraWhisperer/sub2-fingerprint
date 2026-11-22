@@ -53,10 +53,7 @@ class Lifecycle(unittest.TestCase):
         state = self.tmp/'var/lib'/d.NAME
         state.parent.mkdir(parents=True)
         self.stack.enter_context(patch.multiple(d, ROOT=root, UNIT=unit, SOCKET=sock, STATE=state, RUNS=root/'data/runs',
-                                                RUNTIME=root.with_name(d.NAME+'-runtime'),
                                                 MARKER=root/'install-manifest.json', BUNDLE=self.vendor))
-        if os.name == 'nt':
-            self.stack.enter_context(patch.object(u, 'SYSTEM_ZSTD', u.shutil.which('zstd') or 'zstd.exe'))
         self.user = None
         self.group = None
         self.commands = []
@@ -108,7 +105,7 @@ class Lifecycle(unittest.TestCase):
         elif args[0] == 'systemd-analyze' and self.reject_verify:
             raise ValueError('simulated unit verification failure')
         elif args[0] == 'systemctl' and args[1] != 'daemon-reload':
-            unit = d.UNIT if args[-1] == d.UNIT.name else d.SOCKET
+            unit = d.UNIT.parent / args[-1]
             if args[1] == 'enable':
                 self.enabled.add(unit)
             if args[1] == 'disable':
@@ -120,11 +117,14 @@ class Lifecycle(unittest.TestCase):
         return SimpleNamespace(returncode=0, stdout='')
 
     def install(self):
-        d.perform_install('http://127.0.0.1:8080',d.bundle_files(self.vendor))
-        self.assertEqual(self.active,{d.SOCKET})
-        self.assertEqual(self.enabled,{d.SOCKET})
+        d.perform_install('http://127.0.0.1:8080', 'fixture-probe-key', 'Probe', d.bundle_files(self.vendor))
+        self.assertEqual(self.active,{d.SOCKET, d.update_units()[0]})
+        self.assertEqual(self.enabled,{d.SOCKET, d.update_units()[0]})
         self.assertFalse(d.RUNS.exists())
-        self.assertEqual(json.loads((d.ROOT/'config/config.json').read_text())['parallel'],3)
+        config = json.loads((d.ROOT/'config/config.json').read_text())
+        self.assertEqual(config['parallel'], 1)
+        self.assertEqual(config['probe_api_key'], 'fixture-probe-key')
+        self.assertEqual(config['probe_group_name'], 'Probe')
         session = d.STATE/('a'*64+'.session')
         session.write_bytes(b'fixture renewable session')
         return session
@@ -138,7 +138,8 @@ class Lifecycle(unittest.TestCase):
             dest.parent.mkdir(parents=True,exist_ok=True)
             dest.write_text('v0.1.0' if name=='VERSION' else 'old '+name)
         (d.ROOT/'config').mkdir()
-        (d.ROOT/'config/config.json').write_text('{"parallel":2,"data_dir":"/previous"}')
+        (d.ROOT/'config/config.json').write_text(
+            '{"parallel":1,"data_dir":"/previous","probe_api_key":"fixture-probe-key","probe_group_name":"Probe"}')
         d.UNIT.write_bytes((d.ROOT/'docs'/d.UNIT.name).read_bytes())
         d.jwrite(d.MARKER, dict(format=1,root=str(d.ROOT),dev=d.ROOT.stat().st_dev,ino=d.ROOT.stat().st_ino,
             uid=self.user.pw_uid,gid=self.group.gr_gid,service=str(d.UNIT),unit_sha256=d.digest(d.UNIT),
@@ -154,103 +155,12 @@ class Lifecycle(unittest.TestCase):
     def apply(self):
         u.apply(self.successor, d.bundle_files(self.successor), d.verify_manifest(), d.ROOT/'.rollback')
 
-    @contextlib.contextmanager
-    def runtime_release(self, content, machine=62, bad_archive=False, bad_plain=False):
-        plain = b'\x7fELF\x02\x01' + bytes(12) + machine.to_bytes(2, 'little') + content
-        # One small raw block in a real zstd frame. Test fixtures require no compressor or network.
-        compressed = (b'\x28\xb5\x2f\xfd\x20' + bytes([len(plain)]) +
-                      ((len(plain) << 3) | 1).to_bytes(3, 'little') + plain)
-        pin = (len(compressed), hashlib.sha256(compressed).hexdigest(), len(plain),
-               '0'*64 if bad_plain else hashlib.sha256(plain).hexdigest())
-        with patch.object(u.platform, 'machine', return_value='x86_64'), patch.dict(u.RUNTIME_ASSETS, x86_64=pin), \
-                patch.object(u, 'http', side_effect=lambda url: io.BytesIO(compressed[:-1] if bad_archive else compressed)) as fetch:
-            yield plain, fetch
-
-    def test_runtime_installs_once_updates_and_uninstalls_only_owned_files(self):
-        session = self.install()
-        neighbor = d.RUNTIME.parent/'other-project'
-        neighbor.write_bytes(b'keep')
-        binary = d.RUNTIME/d.RUNTIME_BINARY
-        with self.runtime_release(b'first') as (first, fetch):
-            u.install_runtime()
-            self.assertEqual(binary.read_bytes(), first)
-            u.install_runtime()
-            fetch.assert_called_once_with('https://github.com/openai/codex/releases/download/' + u.RUNTIME_TAG +
-                                          '/codex-app-server-x86_64-unknown-linux-musl.zst')
-        with patch.object(u,'health'):
-            self.apply()
-        self.assertEqual(binary.read_bytes(), first)
-        with self.runtime_release(b'successor') as (second, _):
-            u.install_runtime()
-            self.assertEqual(binary.read_bytes(), second)
-            self.assertEqual(d.verify_runtime()['sha256'], hashlib.sha256(second).hexdigest())
-        self.assertEqual({p.name for p in d.RUNTIME.iterdir()}, {d.RUNTIME_MARKER, d.RUNTIME_BINARY})
-        self.assertTrue(session.exists())
-        d.uninstall(SimpleNamespace(check=True))
-        self.assertTrue(binary.is_file())
-        d.uninstall(SimpleNamespace(check=False))
-        self.assertFalse(any(p.exists() for p in (d.RUNTIME, d.ROOT, d.STATE)))
-        self.assertEqual(neighbor.read_bytes(), b'keep')
-        self.assertFalse(list(neighbor.parent.glob('.sub2-fingerprint-runtime-*')))
-
-    def test_runtime_failed_or_interrupted_update_preserves_verified_executable(self):
-        self.install()
-        binary = d.RUNTIME/d.RUNTIME_BINARY
-        with self.runtime_release(b'original') as (original, _):
-            u.install_runtime()
-        original_id = d.verify_runtime()
-        for changes in ({'bad_archive': True}, {'bad_plain': True}, {'machine': 183}):
-            with self.subTest(changes=changes), self.runtime_release(b'bad-update', **changes), self.assertRaises(ValueError):
-                u.install_runtime()
-            self.assertEqual(binary.read_bytes(), original)
-            self.assertEqual(d.verify_runtime(), original_id)
-        replace = os.replace
-        def interrupt(src, dest):
-            if dest == binary:
-                raise OSError('interrupted before binary rename')
-            replace(src, dest)
-        with self.runtime_release(b'successor') as (second, _):
-            with patch.object(os, 'replace', side_effect=interrupt), self.assertRaisesRegex(OSError, 'interrupted'):
-                u.install_runtime()
-            self.assertEqual(d.verify_runtime(), original_id)
-            u.install_runtime()
-            self.assertEqual(binary.read_bytes(), second)
-        self.assertFalse(list(d.RUNTIME.parent.glob('.sub2-fingerprint-runtime-*')))
-
-    def test_runtime_refuses_unowned_directory_unknown_file_and_changed_binary(self):
-        session = self.install()
-        d.RUNTIME.mkdir()
-        foreign = d.RUNTIME/'personal-file'
-        foreign.write_bytes(b'keep')
-        with self.runtime_release(b'owned') as (_, fetch):
-            with self.assertRaises(ValueError):
-                u.install_runtime()
-            fetch.assert_not_called()
-            self.assertEqual(foreign.read_bytes(), b'keep')
-            foreign.unlink(); d.RUNTIME.rmdir()
-            u.install_runtime()
-        foreign.write_bytes(b'keep')
-        with self.assertRaises(ValueError):
-            d.uninstall(SimpleNamespace(check=False))
-        self.assertEqual(foreign.read_bytes(), b'keep')
-        foreign.unlink()
-        binary = d.RUNTIME/d.RUNTIME_BINARY
-        binary.write_bytes(b'locally replaced')
-        with self.runtime_release(b'update') as (_, fetch), self.assertRaises(ValueError):
-            u.install_runtime()
-        fetch.assert_not_called()
-        with self.assertRaises(ValueError):
-            d.uninstall(SimpleNamespace(check=False))
-        self.assertTrue(session.exists())
-        self.assertEqual(binary.read_bytes(), b'locally replaced')
-        self.assertFalse(any(cmd[:2] == ('systemctl','stop') for cmd in self.commands))
-
     def test_failed_fresh_install_removes_only_new_resources(self):
         neighbor = d.ROOT.parent/'sub2api'
         neighbor.write_text('live site')
         self.reject_verify = True
         with self.assertRaisesRegex(ValueError, 'simulated'):
-            d.perform_install('http://127.0.0.1:8080', d.bundle_files(self.vendor))
+            d.perform_install('http://127.0.0.1:8080', 'fixture-probe-key', 'Probe', d.bundle_files(self.vendor))
         self.assertEqual((self.user,self.group),(None,None))
         self.assertFalse(any(p.exists() for p in (d.ROOT,d.STATE,d.UNIT,d.SOCKET)))
         self.assertEqual(neighbor.read_text(),'live site')
@@ -291,8 +201,8 @@ class Lifecycle(unittest.TestCase):
             self.assertIn(d.SOCKET,self.active)
         with patch.object(u,'health',side_effect=live_test), patch.object(u,'owned_process',return_value=True):
             self.apply()
-        self.assertEqual(self.active,{d.SOCKET})
-        self.assertEqual(self.enabled,{d.SOCKET})
+        self.assertEqual(self.active,{d.SOCKET, d.update_units()[0]})
+        self.assertEqual(self.enabled,{d.SOCKET, d.update_units()[0]})
         self.assertFalse(d.RUNS.parent.exists())
         self.assertEqual((d.ROOT/'config/config.json').read_bytes(),cfg)
         self.assertTrue(d.STATE.is_dir())
@@ -336,8 +246,8 @@ class Lifecycle(unittest.TestCase):
             self.apply()
         self.assertEqual(d.MARKER.read_bytes(),stamp)
         self.assertEqual(session.read_bytes(),b'fixture renewable session')
-        self.assertEqual(self.active,{d.SOCKET})
-        self.assertEqual(self.enabled,{d.SOCKET})
+        self.assertEqual(self.active,{d.SOCKET, d.update_units()[0]})
+        self.assertEqual(self.enabled,{d.SOCKET, d.update_units()[0]})
         self.assertFalse((d.ROOT/'LICENSES/extra.txt').exists())
 
     def test_committed_migration_resumes_interrupted_purge(self):
@@ -361,6 +271,133 @@ class Lifecycle(unittest.TestCase):
             with self.assertRaises(ValueError): u.health()
             same.return_value=True
             u.health()
+
+    def test_existing_install_gains_update_units_and_preserves_config(self):
+        session = self.install()
+        meta = d.verify_manifest()
+        for unit in d.update_units():
+            unit.unlink()
+            self.active.discard(unit)
+            self.enabled.discard(unit)
+            doc = 'docs/' + unit.name
+            (d.ROOT / doc).unlink()
+            meta['files'].remove(doc)
+        del meta['update_units']
+        d.MARKER.write_text(json.dumps(meta))
+        config = (d.ROOT / 'config/config.json').read_bytes()
+        with patch.object(u, 'health'):
+            self.apply()
+        self.assertEqual(set(d.verify_manifest()['update_units']), {unit.name for unit in d.update_units()})
+        self.assertIn(d.update_units()[0], self.active)
+        self.assertEqual(config, (d.ROOT / 'config/config.json').read_bytes())
+        self.assertTrue(session.exists())
+
+    def test_same_version_repairs_units_omitted_by_old_updater(self):
+        session = self.install()
+        meta = d.verify_manifest()
+        for unit in d.update_units():
+            unit.unlink()
+            self.active.discard(unit)
+            self.enabled.discard(unit)
+            doc = 'docs/' + unit.name
+            (d.ROOT / doc).unlink()
+            meta['files'].remove(doc)
+        del meta['update_units']
+        d.MARKER.write_text(json.dumps(meta))
+        # The old updater copied the new VERSION and scripts using its old ENTRY.
+        (d.ROOT / 'VERSION').write_text('v0.2.1\n')
+        original = d.MARKER.read_bytes()
+        config = (d.ROOT / 'config/config.json').read_bytes()
+        archive = self.tmp / 'release.tar.gz'
+        with tarfile.open(archive, 'w:gz') as out:
+            out.add(self.successor, arcname='release')
+        payload = archive.read_bytes()
+        args = SimpleNamespace(recover=False, migrate=False, archive=None, check=False)
+        with patch.object(u, 'release_info', return_value=((0, 2, 1), 'fixture', hashlib.sha256(payload).hexdigest(), len(payload))), \
+                patch.object(u, 'http', side_effect=lambda _: io.BytesIO(payload)), patch.object(d, 'check_arch'):
+            args.check = True
+            u.update(args)
+            self.assertEqual(d.MARKER.read_bytes(), original)
+            args.check = False
+            with patch.object(u, 'health', side_effect=[ValueError('bad repair'), None]), self.assertRaisesRegex(ValueError, 'bad repair'):
+                u.update(args)
+            self.assertEqual(d.MARKER.read_bytes(), original)
+            self.assertFalse(any(unit.exists() for unit in d.update_units()))
+            self.assertEqual(self.active, {d.SOCKET})
+            with patch.object(u, 'health'):
+                u.update(args)
+            self.assertEqual(set(d.verify_manifest()['update_units']), {unit.name for unit in d.update_units()})
+            self.assertIn(d.update_units()[0], self.active)
+            self.assertEqual(config, (d.ROOT / 'config/config.json').read_bytes())
+            self.assertTrue(session.exists())
+            # Once repaired, the same version must remain a no-op.
+            with patch.object(u, 'apply', side_effect=AssertionError('reapplied current version')):
+                u.update(args)
+
+    def test_failed_update_restores_update_units_and_disabled_watcher(self):
+        self.install()
+        watcher, worker = d.update_units()
+        self.active.discard(watcher)
+        self.enabled.discard(watcher)
+        originals = {unit: unit.read_bytes() for unit in (watcher, worker)}
+        with patch.object(u, 'health', side_effect=[ValueError('failed health'), None]), self.assertRaises(ValueError):
+            self.apply()
+        for unit, data in originals.items():
+            self.assertEqual(unit.read_bytes(), data)
+        self.assertNotIn(watcher, self.active)
+        self.assertNotIn(watcher, self.enabled)
+        d.verify_manifest()
+
+    def test_uninstall_removes_update_units(self):
+        self.install()
+        d.uninstall(SimpleNamespace(check=False))
+        self.assertFalse(any(unit.exists() for unit in d.update_units()))
+        self.assertFalse(self.active or self.enabled)
+
+
+class WebUpdates(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.trigger = self.root / 'update.request'
+        self.status = self.root / 'status.json'
+        real_path = Path
+        paths = {'/run/sub2-fingerprint/update.request': self.trigger,
+                 '/run/sub2-fingerprint-update': self.root,
+                 '/run/sub2-fingerprint-update/status.json': self.status}
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(u, 'Path', side_effect=lambda p: paths.get(str(p), real_path(p))))
+        self.stack.enter_context(patch.object(d, 'root_owned', return_value=True))
+        self.stack.enter_context(patch.object(d, 'maintenance_lock', side_effect=contextlib.nullcontext))
+
+    def test_fixed_request_records_success_and_is_consumed(self):
+        self.trigger.write_bytes(b'')
+        with patch.object(u, 'update') as update:
+            u.web_update(SimpleNamespace())
+        update.assert_called_once()
+        self.assertFalse(self.trigger.exists())
+        self.assertEqual(json.loads(self.status.read_text()), {'state': 'done'})
+        u.web_finished()
+        self.assertEqual(json.loads(self.status.read_text())['state'], 'done')
+
+    def test_failure_and_abnormal_exit_record_sanitized_status(self):
+        self.trigger.write_bytes(b'')
+        with patch.object(u, 'update', side_effect=ValueError('private upstream details')), self.assertRaises(ValueError):
+            u.web_update(SimpleNamespace())
+        self.assertEqual(json.loads(self.status.read_text()), {'state': 'failed'})
+        u.web_status('running')
+        u.web_finished()
+        self.assertEqual(json.loads(self.status.read_text()), {'state': 'failed'})
+
+    def test_request_cannot_supply_commands(self):
+        for content in (None, b'arbitrary command'):
+            if content is not None:
+                self.trigger.write_bytes(content)
+            with patch.object(u, 'update') as update, self.assertRaises(ValueError):
+                u.web_update(SimpleNamespace())
+            update.assert_not_called()
 
 
 class Releases(unittest.TestCase):
