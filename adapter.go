@@ -726,6 +726,37 @@ type providerProblem struct {
 	Message string `json:"message"`
 }
 
+var (
+	arraySubscript         = regexp.MustCompile(`\[[0-9]+\]`)
+	parameterMessage       = regexp.MustCompile(`^(unsupported parameter|missing required parameter)(?::\s*|\s+)('[^'\r\n]+'|"[^"\r\n]+"|\x60[^\x60\r\n]+\x60|[^'"\x60\s]+)`)
+	quotedModelUnavailable = regexp.MustCompile(`\bmodel ['"\x60][^'"\x60\r\n]+['"\x60] (?:is (?:not (?:supported|available|found)|unsupported)|does not exist|was not found)\b`)
+)
+
+func parameterValidation(source, field, kind string) *GateError {
+	// Reveal only known field paths. Array positions and all values are discarded.
+	field = arraySubscript.ReplaceAllString(field, "[]")
+	switch field {
+	case "model", "reasoning", "reasoning.effort", "input", "input[]", "input[].role", "input[].content", "input[].content[]", "input[].content[].type", "input[].content[].text",
+		"instructions", "store", "stream", "tools", "include", "include[]", "tool_choice", "max_output_tokens", "temperature", "top_p":
+	default:
+		return nil
+	}
+	var reason string
+	switch kind {
+	case "missing_required_parameter", "missing required parameter", "missing", "value_error.missing", "field required":
+		reason = "指出请求缺少必填参数 %s"
+	case "unsupported_parameter", "unsupported parameter", "extra_forbidden", "value_error.extra", "extra inputs are not permitted":
+		reason = "不支持请求参数 %s"
+	case "string_type", "list_type", "dict_type", "bool_type", "bool_parsing", "type_error.str", "type_error.list", "type_error.dict", "type_error.bool":
+		reason = "指出参数 %s 的类型有误"
+	case "literal_error", "value_error.const":
+		reason = "指出参数 %s 的取值有误"
+	default:
+		return nil
+	}
+	return gate("UPSTREAM_PARAMETER", source+fmt.Sprintf(reason, field))
+}
+
 func (p providerProblem) diagnostic(source string) *GateError {
 	model := func() *GateError {
 		return gate("UPSTREAM_MODEL", source+"指出模型不可用或模型参数有误，请核对该账号能否使用 "+probeModel)
@@ -735,6 +766,21 @@ func (p providerProblem) diagnostic(source string) *GateError {
 	}
 	client := func() *GateError {
 		return gate("UPSTREAM_CLIENT", source+"拒绝当前客户端或版本，请核对该账号允许的客户端")
+	}
+	m := strings.ToLower(strings.TrimSpace(p.Message))
+	if strings.Contains(m, "requires a newer version of codex") {
+		return gate("UPSTREAM_CLIENT", source+"要求使用更新版本的 Codex 客户端")
+	}
+	if hint := parameterValidation(source, p.Param, p.Code); hint != nil {
+		return hint
+	}
+	if match := parameterMessage.FindStringSubmatch(m); match != nil {
+		field := strings.Trim(strings.TrimSuffix(match[2], "."), "'\"\x60")
+		if p.Param == "" || p.Param == field {
+			if hint := parameterValidation(source, field, match[1]); hint != nil {
+				return hint
+			}
+		}
 	}
 	switch p.Param {
 	case "reasoning.effort", "reasoning":
@@ -753,7 +799,6 @@ func (p providerProblem) diagnostic(source string) *GateError {
 		return gate("UPSTREAM_INPUT", source+"指出输入超过模型上下文限制")
 	}
 	// Some ChatGPT responses contain only a human-readable detail.
-	m := strings.ToLower(p.Message)
 	switch {
 	case p.Code == "server_is_overloaded", p.Code == "slow_down", strings.Contains(m, "selected model is at capacity"):
 		return gate("UPSTREAM_OVERLOAD", source+"报告服务过载，请稍后再测")
@@ -761,13 +806,61 @@ func (p providerProblem) diagnostic(source string) *GateError {
 		return client()
 	case strings.Contains(m, "reasoning effort") && (strings.Contains(m, "not supported") || strings.Contains(m, "does not support") || strings.Contains(m, "unsupported")):
 		return effort()
-	case strings.Contains(m, "model is not supported"), strings.Contains(m, "model is not available"), strings.Contains(m, "model not found"), strings.Contains(m, "does not exist or you do not have access"):
+	case quotedModelUnavailable.MatchString(m), strings.Contains(m, "model is not supported"), strings.Contains(m, "model is not available"), strings.Contains(m, "model not found"), strings.Contains(m, "does not exist or you do not have access"):
 		return model()
 	}
 	return nil
 }
 
 var upstreamRequestRef = regexp.MustCompile(`^(?:req_[0-9A-Fa-f]{16,64}|[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12})$`)
+
+func validationField(loc []any) string {
+	var field strings.Builder
+	for i, part := range loc {
+		switch v := part.(type) {
+		case string:
+			if i == 0 && v == "body" {
+				continue
+			}
+			if v == "" || strings.ContainsAny(v, ".[]") {
+				return ""
+			}
+			if field.Len() > 0 {
+				field.WriteByte('.')
+			}
+			field.WriteString(v)
+		case float64:
+			if v < 0 || v != float64(int(v)) {
+				return ""
+			}
+			field.WriteString("[]")
+		default:
+			return ""
+		}
+	}
+	return field.String()
+}
+
+// Validation details may include the full original input. Read only the location and category.
+func validationListDiagnostic(source string, detail json.RawMessage) *GateError {
+	var issues []struct {
+		Loc       []any
+		Type, Msg string
+	}
+	if json.Unmarshal(detail, &issues) != nil {
+		return nil
+	}
+	for _, issue := range issues {
+		field := validationField(issue.Loc)
+		if hint := parameterValidation(source, field, issue.Type); hint != nil {
+			return hint
+		}
+		if hint := parameterValidation(source, field, strings.ToLower(issue.Msg)); hint != nil {
+			return hint
+		}
+	}
+	return nil
+}
 
 func upstreamBadRequest(resp *http.Response) error {
 	source := "模型上游（HTTP 400）"
@@ -792,6 +885,9 @@ func upstreamBadRequest(resp *http.Response) error {
 			if hint := problem.diagnostic(source); hint != nil {
 				return hint
 			}
+		}
+		if hint := validationListDiagnostic(source, message.Detail); hint != nil {
+			return hint
 		}
 	}
 	return gate("UPSTREAM_BAD_REQUEST", source+"拒绝本次请求，未给出可识别的具体原因")

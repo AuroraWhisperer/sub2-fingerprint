@@ -31,6 +31,7 @@ func TestProbePreservesReasonsForUpstreamFailure(t *testing.T) {
 		{"reasoning", `{"error":{"code":"unsupported_value","param":"reasoning.effort","message":"fixture-private-input"}}`, "UPSTREAM_REASONING", false},
 		{"detail string", `{"detail":"The 'gpt-6-astra' model is not supported when using this account. fixture-private-input"}`, "UPSTREAM_MODEL", false},
 		{"client", `{"detail":{"code":"unsupported_client_version","message":"fixture-private-input"}}`, "UPSTREAM_CLIENT", false},
+		{"client version in HTTP detail", `{"detail":"The 'gpt-6-astra' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}`, "UPSTREAM_CLIENT", false},
 		{"nested slow down", `{"response":{"error":{"code":"slow_down","message":"fixture-private-input"}}}`, "UPSTREAM_OVERLOAD", false},
 		{"capacity message", `{"message":"The selected model is at capacity. fixture-private-input"}`, "UPSTREAM_OVERLOAD", false},
 		{"capacity in echoed input", `{"input":"The selected model is at capacity. fixture-private-input"}`, "UPSTREAM_BAD_REQUEST", false},
@@ -81,6 +82,34 @@ func TestProbePreservesReasonsForUpstreamFailure(t *testing.T) {
 			}
 			if count.Load() != 1 || answer.Text != "" || strings.Contains(err.Error(), sensitive) || (tc.stream == strings.Contains(err.Error(), "HTTP 400")) {
 				t.Fatal("failed request retried, scored, leaked private detail or lost failure stage")
+			}
+		})
+	}
+}
+
+func TestBadRequestIdentifiesProtocolCauseWithoutEchoingInput(t *testing.T) {
+	const private = "fixture-private-input"
+	cases := []struct{ name, body, code, hint string }{
+		{"quoted model after noun", `{"error":{"message":"The model 'fixture-private-input' is not supported with this account."}}`, "UPSTREAM_MODEL", probeModel},
+		{"model needs a newer CLI", `{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6-astra' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}}`, "UPSTREAM_CLIENT", "要求使用更新版本的 Codex 客户端"},
+		{"message with quoted parameter", `{"error":{"message":"Unsupported parameter: 'max_output_tokens' is not supported with this model. fixture-private-input"}}`, "UPSTREAM_PARAMETER", "不支持请求参数 max_output_tokens"},
+		{"structured field and code", `{"error":{"code":"missing_required_parameter","param":"instructions","message":"fixture-private-input"}}`, "UPSTREAM_PARAMETER", "缺少必填参数 instructions"},
+		{"bare parameter", `{"detail":"Unsupported parameter: temperature"}`, "UPSTREAM_PARAMETER", "不支持请求参数 temperature"},
+		{"nested parameter in message", `{"error":{"message":"Missing required parameter: 'input[13].content[2].text'. fixture-private-input"}}`, "UPSTREAM_PARAMETER", "缺少必填参数 input[].content[].text"},
+		{"validation list", `{"detail":[{"loc":["body","fixture-private-input"],"type":"missing"},{"loc":["body","input",13,"content",2,"text"],"type":"string_type","msg":"fixture-private-input","input":{"private":"fixture-private-input"}}]}`, "UPSTREAM_PARAMETER", "参数 input[].content[].text 的类型有误"},
+		{"legacy extra field", `{"detail":[{"loc":["body","tools"],"type":"value_error.extra","msg":"fixture-private-input"}]}`, "UPSTREAM_PARAMETER", "不支持请求参数 tools"},
+		{"literal requirement", `{"detail":[{"loc":["body","reasoning","effort"],"type":"literal_error","ctx":{"expected":"fixture-private-input"}}]}`, "UPSTREAM_PARAMETER", "参数 reasoning.effort 的取值有误"},
+		{"exact validation message", `{"detail":[{"loc":["body","store"],"msg":"Field required","input":"fixture-private-input"}]}`, "UPSTREAM_PARAMETER", "缺少必填参数 store"},
+		{"private name with public prefix", `{"detail":"Missing required parameter: 'input.fixture-private-input'."}`, "UPSTREAM_BAD_REQUEST", "未给出可识别"},
+		{"private name with public suffix", `{"detail":[{"loc":["headers","fixture-private-input","model"],"type":"missing","msg":"Field required"}]}`, "UPSTREAM_BAD_REQUEST", "未给出可识别"},
+		{"ignored validation input", `{"detail":[{"loc":["body","input"],"type":"fixture-private-input","msg":"fixture-private-input","input":"Unsupported parameter: store"}]}`, "UPSTREAM_BAD_REQUEST", "未给出可识别"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := upstreamBadRequest(&http.Response{Body: io.NopCloser(strings.NewReader(tc.body))})
+			assertGate(t, err, tc.code)
+			if !strings.Contains(err.Error(), tc.hint) || strings.Contains(err.Error(), private) {
+				t.Fatalf("unexpected user-facing diagnostic: %s", err)
 			}
 		})
 	}
