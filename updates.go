@@ -33,6 +33,7 @@ type updateStatus struct {
 
 type updater struct {
 	mu          sync.Mutex // Serializes installation requests with detection submissions.
+	checkMu     sync.Mutex // Coalesces checks without blocking status or detection.
 	requestPath string
 	statusPath  string
 	unitPath    string
@@ -114,8 +115,19 @@ func (u *updater) status() (updateStatus, error) {
 
 func updateBusy(s updateStatus) bool { return s.State == "queued" || s.State == "running" }
 
+// The caller holds u.mu when checking or reserving an installation or detection.
+func (u *updater) detectionReady() bool {
+	s, err := u.status()
+	return err == nil && !updateBusy(s)
+}
+
 func (u *updater) check(ctx context.Context) error {
-	if !u.checked.IsZero() && time.Since(u.checked) < time.Minute {
+	u.checkMu.Lock()
+	defer u.checkMu.Unlock()
+	u.mu.Lock()
+	fresh := time.Since(u.checked) < time.Minute
+	u.mu.Unlock()
+	if fresh {
 		return nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.latestURL, nil)
@@ -142,14 +154,14 @@ func (u *updater) check(ctx context.Context) error {
 		release.Draft || release.Prerelease || !stableVersion.MatchString(release.Tag) {
 		return errors.New("invalid stable release")
 	}
+	u.mu.Lock()
 	u.latest, u.checked = release.Tag, time.Now()
+	u.mu.Unlock()
 	return nil
 }
 
 func (a *app) updateRoute(w http.ResponseWriter, r *http.Request) {
 	u := a.updater
-	u.mu.Lock()
-	defer u.mu.Unlock()
 	method := http.MethodPost
 	if r.URL.Path == "/api/update" {
 		method = http.MethodGet
@@ -168,33 +180,46 @@ func (a *app) updateRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s, err := u.status()
-	if err != nil {
-		fail(w, 503, "UPDATE_STATUS", "无法读取更新状态，请检查服务器更新服务。")
-		return
-	}
-	if r.URL.Path != "/api/update/install" {
-		respond(w, 200, s)
-		return
-	}
-	if !s.Supported {
-		fail(w, 409, "UPDATE_UNSUPPORTED", "此安装尚未启用页面更新，请在服务器再次运行命令行更新以补齐服务。")
-		return
-	}
-	if updateBusy(s) {
-		respond(w, 202, s)
-		return
-	}
-	if a.queue.busy() {
-		fail(w, 409, "DETECTION_ACTIVE", "检测尚未结束，请等待账号释放后再更新。")
-		return
-	}
-	if u.checked.IsZero() || time.Since(u.checked) >= time.Minute {
-		if err := u.check(r.Context()); err != nil {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for {
+		s, err := u.status()
+		if err != nil {
+			fail(w, 503, "UPDATE_STATUS", "无法读取更新状态，请检查服务器更新服务。")
+			return
+		}
+		if r.URL.Path != "/api/update/install" {
+			respond(w, 200, s)
+			return
+		}
+		if !s.Supported {
+			fail(w, 409, "UPDATE_UNSUPPORTED", "此安装尚未启用页面更新，请在服务器再次运行命令行更新以补齐服务。")
+			return
+		}
+		if updateBusy(s) {
+			respond(w, 202, s)
+			return
+		}
+		if a.queue.busy() {
+			fail(w, 409, "DETECTION_ACTIVE", "检测尚未结束，请等待账号释放后再更新。")
+			return
+		}
+		if time.Since(u.checked) < time.Minute {
+			a.requestUpdate(w, s)
+			return
+		}
+		u.mu.Unlock()
+		err = u.check(r.Context())
+		u.mu.Lock()
+		if err != nil {
 			fail(w, 502, "UPDATE_CHECK", "无法核对 GitHub 最新版本，请稍后重试。")
 			return
 		}
 	}
+}
+
+func (a *app) requestUpdate(w http.ResponseWriter, s updateStatus) {
+	u := a.updater
 	if !newerVersion(u.latest, s.Current) {
 		s.Latest, s.Available, s.Message = u.latest, false, "当前已是最新正式版。"
 		respond(w, 200, s)

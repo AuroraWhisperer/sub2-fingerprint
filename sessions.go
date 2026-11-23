@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +23,7 @@ const externalSessionPeriod = 30 * time.Minute
 type session struct {
 	mu                                  sync.Mutex // Sub2API rotates refresh tokens. One request at a time may refresh or log out this session.
 	key, csrf, jwt, refresh, temp       string
+	probeJWT                            *atomic.Pointer[string]
 	owner                               int64
 	end, accessEnd                      time.Time
 	remember, verified, dirty, external bool
@@ -69,16 +71,21 @@ func (a *app) attachExternal(w http.ResponseWriter, ctx context.Context, token s
 		a.sharedAuthFailure(w, err)
 		return nil, false
 	}
-	s, ok := a.replace(w, nil, LoginResult{
+	return a.replace(w, nil, LoginResult{
 		JWT:       token,
 		UserID:    owner,
 		Admin:     true,
 		ExpiresIn: int(externalSessionPeriod / time.Second),
-	}, false)
-	if ok {
-		s.external = true
+	}, false, true)
+}
+
+// Running batches keep the credential slot for the administrator who started them.
+func (s *session) publishJWT() {
+	if s.probeJWT == nil {
+		s.probeJWT = new(atomic.Pointer[string])
 	}
-	return s, ok
+	token := s.jwt
+	s.probeJWT.Store(&token)
 }
 
 func (a *app) bindExternal(ctx context.Context, s *session, token string) error {
@@ -97,13 +104,20 @@ func (a *app) bindExternal(ctx context.Context, s *session, token string) error 
 	s.jwt = token
 	s.refresh = ""
 	s.temp = ""
-	s.owner = owner
+	if s.owner != owner {
+		s.probeJWT = nil
+		s.owner = owner
+	}
 	s.accessEnd = time.Now().Add(externalSessionPeriod)
-	s.end = time.Now().Add(externalSessionPeriod)
+	// The caller holds s.mu. The expiry scan also reads end under a.mu.
+	a.mu.Lock()
+	s.end = s.accessEnd
+	a.mu.Unlock()
 	s.remember = false
 	s.verified = true
 	s.dirty = false
 	s.external = true
+	s.publishJWT()
 	return nil
 }
 
@@ -164,7 +178,7 @@ func (a *app) loadLogins() error {
 		if len(a.sessions) >= 48 {
 			return errors.New("too many saved logins")
 		}
-		ctx, cancel := context.WithDeadline(context.Background(), rec.End)
+		ctx, cancel := context.WithCancel(context.Background())
 		a.sessions[key] = &session{key: key, csrf: rec.CSRF, owner: rec.Owner, refresh: rec.Refresh, end: rec.End, remember: true, ctx: ctx, cancel: cancel}
 	}
 	return nil
@@ -240,7 +254,10 @@ func (a *app) prune() {
 	a.mu.Unlock()
 	for _, s := range expired {
 		s.mu.Lock()
-		_ = a.dropLogin(s)
+		if !time.Now().Before(s.end) {
+			s.cancel()
+			_ = a.dropLogin(s)
+		}
 		s.mu.Unlock()
 	}
 }
@@ -274,7 +291,7 @@ func accessTTL(seconds int) time.Duration {
 	return 30 * time.Minute
 }
 
-func (a *app) replace(w http.ResponseWriter, old *session, info LoginResult, remember bool) (*session, bool) {
+func (a *app) replace(w http.ResponseWriter, old *session, info LoginResult, remember, external bool) (*session, bool) {
 	if old != nil {
 		if err := a.dropLogin(old); err != nil {
 			fault(w, gate("SESSION_STORE", "登录状态暂时无法保存，请重试"))
@@ -302,9 +319,12 @@ func (a *app) replace(w http.ResponseWriter, old *session, info LoginResult, rem
 		remember = false
 	}
 	end := now.Add(lifetime)
-	ctx, cancel := context.WithDeadline(context.Background(), end)
+	ctx, cancel := context.WithCancel(context.Background())
 	value := randomID()
-	s := &session{key: cookieKey(value), csrf: randomID(), jwt: info.JWT, refresh: info.Refresh, temp: info.Temp, owner: info.UserID, end: end, accessEnd: now.Add(accessTTL(info.ExpiresIn)), remember: remember, verified: info.Admin, ctx: ctx, cancel: cancel}
+	s := &session{key: cookieKey(value), csrf: randomID(), jwt: info.JWT, refresh: info.Refresh, temp: info.Temp, owner: info.UserID, end: end, accessEnd: now.Add(accessTTL(info.ExpiresIn)), remember: remember, verified: info.Admin, external: external, ctx: ctx, cancel: cancel}
+	if s.jwt != "" && s.verified {
+		s.publishJWT()
+	}
 	if s.remember && s.owner > 0 {
 		if err := a.saveLogin(s); err != nil {
 			cancel()
@@ -358,6 +378,7 @@ func (a *app) authorize(ctx context.Context, s *session) error {
 			return err
 		}
 		s.verified = true
+		s.publishJWT()
 	}
 	return nil
 }
@@ -366,9 +387,11 @@ func invalidLogin(err error) bool {
 	var g *GateError
 	return errors.As(err, &g) && (g.Code == "SESSION_INVALID" || g.Code == "UNAUTHORIZED")
 }
-func (a *app) sessionFailure(w http.ResponseWriter, s *session, err error) {
+func (a *app) sessionFailure(w http.ResponseWriter, s *session, jwt string, err error) {
 	if invalidLogin(err) {
-		if a.dropLogin(s) != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.jwt == jwt && a.dropLogin(s) != nil {
 			fail(w, 503, "SESSION_STORE", "无法清除已失效的登录状态")
 			return
 		}

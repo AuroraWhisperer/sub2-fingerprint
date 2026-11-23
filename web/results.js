@@ -13,7 +13,7 @@ export function loadBank() {
 }
 async function readBank() {
   const response = await fetch(
-    new URL("unified_bank.json", document.baseURI),
+    new URL(`unified_bank.json?v=${bankHash}`, document.baseURI),
     {
       credentials: "same-origin",
     },
@@ -88,7 +88,7 @@ export const label = (state) => labels[state] || state || "未知";
 export const active = (state) =>
   state === "running" || state === "queued" || state === "waiting_capacity";
 
-function renderProgress(run) {
+function renderProgress(run, invalid) {
   const progress = document.getElementById("runProgress");
   const bar = document.getElementById("progressBar");
   const labelNode = document.getElementById("progressLabel");
@@ -111,10 +111,8 @@ function renderProgress(run) {
 
   const runningRow = run.rows.find((row) => row.status === "running");
   const waitingRow = run.rows.find((row) => row.status === "waiting_capacity");
-  const allFailed =
-    run.state === "done" &&
-    total > 0 &&
-    run.rows.every((row) => row.status === "failed");
+  const failed = run.rows.filter((row) => row.status === "failed").length;
+  const batchFailed = run.state === "done" && (run.failure || (total > 0 && failed === total));
 
   let progressLabel = label(run.state);
   if (isPending) {
@@ -127,7 +125,7 @@ function renderProgress(run) {
     } else {
       progressLabel = "正在调度队列…";
     }
-  } else if (allFailed) {
+  } else if (batchFailed) {
     progressLabel = "检测失败";
   } else if (run.state === "done") {
     progressLabel = "检测完成";
@@ -137,13 +135,18 @@ function renderProgress(run) {
     progressLabel = "已中断";
   }
 
-  const stateKey = allFailed ? "failed" : run.state;
+  const stateKey = batchFailed ? "failed" : run.state;
   labelNode.textContent = progressLabel;
-  detailNode.textContent = isPending
+  const count = isPending
     ? inFlight > 0
       ? `${complete}/${total} · ${inFlight} 进行中`
       : `${complete}/${total}`
     : `${complete} / ${total}`;
+  detailNode.textContent = [
+    count,
+    failed > 0 ? `失败 ${failed}` : "",
+    invalid > 0 ? `输出无效 ${invalid}` : "",
+  ].filter(Boolean).join(" · ");
   progress.dataset.state = stateKey;
   bar.setAttribute("aria-valuenow", String(percentage));
   bar.setAttribute("aria-valuetext", `${complete} / ${total}`);
@@ -243,7 +246,15 @@ function buildBadges(result, rows, pending, compatible) {
   return wrap;
 }
 
-function answer(row, question, accepted) {
+function setAnswerStatus(node, status, rejected) {
+  const tone = rejected || status === "failed" ? "bad"
+    : status === "done" ? "good"
+    : status === "running" ? "active" : "";
+  node.className = `state ${tone}`.trim();
+  node.textContent = rejected ? "输出无效" : label(status);
+}
+
+function answer(row, question, rejected) {
   const node = el("div", null, "detail-box answer");
   const sum = el("div", null, "detail-summary");
   sum.append(el("span", `挑战 ${question?.number ?? "?"}`, "ans-title"));
@@ -252,17 +263,9 @@ function answer(row, question, accepted) {
   if (row.model) {
     meta.append(el("span", row.model, "model-tag"));
   }
-  const statusText =
-    accepted === false ? "输出无效" : label(row.status);
-  const statusTone =
-    accepted === false || row.status === "failed"
-      ? "bad"
-      : row.status === "done"
-        ? "good"
-        : row.status === "running"
-          ? "active"
-          : "";
-  meta.append(el("span", statusText, `state ${statusTone}`.trim()));
+  const state = el("span");
+  setAnswerStatus(state, row.status, rejected);
+  meta.append(state);
   sum.append(meta);
   node.append(sum);
 
@@ -288,51 +291,86 @@ function answer(row, question, accepted) {
   return node;
 }
 
+const renderedRuns = new WeakMap();
+
 export function renderRun(container, run, bank, bankVersion) {
   const questions = new Map(run.questions.map((q) => [q.id, q]));
-  const out = document.createDocumentFragment();
-  renderProgress(run);
-
   const compatible = Boolean(
     run.bank_version && run.bank_version === bankVersion && bank,
   );
   const pending = active(run.state);
-  if (!run.bank_version || run.bank_version !== bankVersion) {
-    out.append(
-      el("p", "指纹库与当前批次版本不一致，仅显示原始输出。", "warning-banner"),
-    );
+  let view = renderedRuns.get(container);
+  if (!view || view.id !== run.id || view.list.parentNode !== container) {
+    view = {
+      id: run.id,
+      warning: el("p", "指纹库与当前批次版本不一致，仅显示原始输出。", "warning-banner"),
+      recovery: el("p", null, "warning-banner"),
+      list: el("div", null, "account-list"),
+      accounts: new Map(),
+    };
+    container.replaceChildren(view.warning, view.recovery, view.list);
+    renderedRuns.set(container, view);
   }
+  view.warning.hidden = Boolean(run.bank_version) && run.bank_version === bankVersion;
+  const recoveryFailed = run.failure?.code === "GROUP_RESTORE_FAILED";
+  view.recovery.hidden = !recoveryFailed;
+  if (recoveryFailed)
+    view.recovery.textContent = `账号 #${run.failure.account_id}：${run.failure.message}`;
 
-  const list = el("div", null, "account-list");
+  let invalid = 0;
   for (const { id, rows, result } of accountReports(
     run.rows,
     questions,
     compatible ? bank : null,
     run.state,
   )) {
-    const section = el("article", null, "account-result");
-    const head = el("div", null, "account-head");
-    const title = el("div", null, "account-title");
-    title.append(
-      el("h3", rows[0].name || "账号"),
-      el("span", `#${id}`, "acct-id"),
-    );
-    head.append(title, buildBadges(result, rows, pending, compatible));
-    section.append(head);
-
-    if (result?.score) {
-      section.append(probabilityList(result.score));
-    }
-    const answersWrap = el("div", null, "answers-grid");
-    for (const row of rows) {
-      const q = questions.get(row.question_id);
-      answersWrap.append(
-        answer(row, q, result?.accepted.get(row.question_id)),
+    if (result) invalid += Array.from(result.accepted.values()).filter((value) => !value).length;
+    let account = view.accounts.get(id);
+    if (!account) {
+      const section = el("article", null, "account-result");
+      const head = el("div", null, "account-head");
+      const title = el("div", null, "account-title");
+      title.append(
+        el("h3", rows[0].name || "账号"),
+        el("span", `#${id}`, "acct-id"),
       );
+      head.append(title);
+      const answers = el("div", null, "answers-grid");
+      section.append(head, answers);
+      view.list.append(section);
+      account = { head, answers, rows: new Map() };
+      view.accounts.set(id, account);
     }
-    section.append(answersWrap);
-    list.append(section);
+
+    const signature = JSON.stringify([rows, pending, compatible]);
+    if (account.signature === signature) continue;
+    account.signature = signature;
+    const badges = buildBadges(result, rows, pending, compatible);
+    if (account.badges) account.badges.replaceWith(badges);
+    else account.head.append(badges);
+    account.badges = badges;
+    account.probabilities?.remove();
+    if (result?.score) {
+      account.probabilities = probabilityList(result.score);
+      account.answers.before(account.probabilities);
+    }
+    for (const row of rows) {
+      const existing = account.rows.get(row.question_id);
+      const rejected = result?.accepted.get(row.question_id) === false;
+      const signature = JSON.stringify(row);
+      if (existing?.signature === signature) {
+        if (existing.rejected !== rejected) {
+          setAnswerStatus(existing.node.querySelector(".detail-meta .state"), row.status, rejected);
+          existing.rejected = rejected;
+        }
+        continue;
+      }
+      const q = questions.get(row.question_id);
+      const node = answer(row, q, rejected);
+      if (existing) existing.node.replaceWith(node);
+      else account.answers.append(node);
+      account.rows.set(row.question_id, { signature, node, rejected });
+    }
   }
-  out.append(list);
-  container.replaceChildren(out);
+  renderProgress(run, invalid);
 }

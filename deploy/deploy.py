@@ -201,16 +201,19 @@ def sync_dir(path):
         finally:
             os.close(fd)
 
-def write_new(path, data, mode):
-    with path.open('x', encoding='utf-8', newline='\n') as f:
+def write_new(path, data, mode, gid=None):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as f:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
+    if gid is not None:
+        os.chown(path, 0, gid)
     os.chmod(path, mode)
     sync_dir(path.parent)
 
-def jwrite(path, obj, mode=0o644):
-    write_new(path, json.dumps(obj, ensure_ascii=False, indent=2) + '\n', mode)
+def jwrite(path, obj, mode=0o644, gid=None):
+    write_new(path, json.dumps(obj, ensure_ascii=False, indent=2) + '\n', mode, gid)
 
 def drop_user():
     if identity()[0] is not None:
@@ -253,8 +256,7 @@ def perform_install(base, probe_key, probe_group_name, files):
         cf = ROOT / 'config/config.json'
         jwrite(cf, {'sub2_url': base, 'parallel': 1, 'listen': f'127.0.0.1:{PORT}',
                     'data_dir': str(RUNS), 'probe_api_key': probe_key,
-                    'probe_group_name': probe_group_name}, 0o640)
-        os.chown(cf, 0, group.gr_gid)
+                    'probe_group_name': probe_group_name}, 0o640, group.gr_gid)
         state = create_state(user.pw_uid, group.gr_gid)
         undo.callback(remove_state, state, user.pw_uid, group.gr_gid)
         service = ROOT / files['units/' + UNIT.name]
@@ -371,7 +373,9 @@ def main():
     modes = parser.add_subparsers(dest='op', required=True)
     ins = modes.add_parser('install')
     ins.add_argument('--sub2-url', required=True)
-    ins.add_argument('--probe-api-key', required=True)
+    key_input = ins.add_mutually_exclusive_group(required=True)
+    key_input.add_argument('--probe-api-key')
+    key_input.add_argument('--probe-api-key-stdin', action='store_true')
     ins.add_argument('--probe-group-name', default='Probe')
     ins.add_argument('--check', action='store_true')
     un = modes.add_parser('uninstall')
@@ -379,7 +383,8 @@ def main():
     args = parser.parse_args()
     if args.op == 'install':
         base = safe_base(args.sub2_url)
-        probe_key = safe_probe_key(args.probe_api_key)
+        probe_key = safe_probe_key(sys.stdin.readline((32 << 10) + 2).rstrip('\r\n')
+                                   if args.probe_api_key_stdin else args.probe_api_key)
         probe_group_name = safe_group_name(args.probe_group_name)
         files = bundle_files(BUNDLE)
         check_arch(BUNDLE / NAME)

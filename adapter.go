@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -36,9 +37,8 @@ const (
 const probeBatchAdminCalls = 4
 
 var (
-	headerValue  = regexp.MustCompile("^[\\x20-\\x7e]+$")
-	accountLabel = regexp.MustCompile("^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
-	modelLabel   = regexp.MustCompile("^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+	headerValue = regexp.MustCompile("^[\\x20-\\x7e]+$")
+	modelLabel  = regexp.MustCompile("^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 )
 
 type Adapter struct {
@@ -137,21 +137,21 @@ func maxProbeBatchTimeout(promptCount int) time.Duration {
 }
 
 func httpFailure(ctx context.Context, err error, side string) error {
-	if errors.Is(ctx.Err(), context.Canceled) {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
 		return gate("CANCELED", "任务已取消")
 	}
 	var timeout net.Error
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
 		return gate("TIMEOUT", side+"请求超时")
 	}
 	return gate("NETWORK", side+"连接失败，请检查服务、代理和证书")
 }
 
 // Translate only known reasons. Remote messages, URLs and body excerpts may carry secrets.
-func adminFailure(status int, reason, path string) error {
+func adminFailure(status int, reason, path string) *GateError {
 	switch reason {
 	case "STEP_UP_REQUIRED":
-		return gate(reason, "本次读取需要 Sub2API 二次验证")
+		return gate(reason, "本次操作需要 Sub2API 二次验证")
 	case "STEP_UP_TOTP_NOT_ENABLED":
 		return gate(reason, "请先在 Sub2API 完成敏感操作验证设置")
 	case "STEP_UP_UNAVAILABLE":
@@ -224,7 +224,9 @@ func (a *Adapter) call(ctx context.Context, method, path, jwt string, payload, d
 		if path == "/auth/refresh" || path == "/auth/me" {
 			return sessionHTTPFailure(resp.StatusCode, details.Reason, string(details.Code), details.Message)
 		}
-		return adminFailure(resp.StatusCode, details.Reason, path)
+		failure := adminFailure(resp.StatusCode, details.Reason, path)
+		failure.status = resp.StatusCode
+		return failure
 	}
 	// Decode into typed structs so refresh_token and arbitrary exported fields never enter application objects.
 	var envelope struct {
@@ -248,7 +250,10 @@ func (a *Adapter) call(ctx context.Context, method, path, jwt string, payload, d
 	return nil
 }
 
-type GateError struct{ Code, Text string }
+type GateError struct {
+	Code, Text string
+	status     int
+}
 
 func (e *GateError) Error() string      { return e.Text }
 func gate(code, text string) *GateError { return &GateError{Code: code, Text: text} }
@@ -457,7 +462,7 @@ func (r accountData) eligibility(now time.Time) string {
 		return "账号设置为仅允许 Codex 官方客户端"
 	case r.Status != "active":
 		return "Sub2API 账号未处于正常状态"
-	case r.Schedulable == nil || r.Busy == nil || *r.Busy < 0 || r.Limit == nil:
+	case r.Schedulable == nil || r.Busy == nil || *r.Busy < 0 || r.Limit == nil || *r.Limit < 0:
 		return "Sub2API 运行状态字段不完整"
 	case !*r.Schedulable:
 		return "Sub2API 已暂停调度"
@@ -593,10 +598,11 @@ func (a *Adapter) updateAccountGroups(ctx context.Context, jwt string, id int64,
 	return a.call(ctx, http.MethodPut, "/admin/accounts/"+strconv.FormatInt(id, 10), jwt, map[string]any{"group_ids": groups}, &struct{}{})
 }
 
-func (a *Adapter) markRecoveryFailed() {
+func (a *Adapter) markRecoveryFailed(id int64, err error) {
 	a.recoveryMu.Lock()
 	a.recoveryFailed = true
 	a.recoveryMu.Unlock()
+	log.Printf("probe group recovery failed for account %d (%s)", id, gateCode(err))
 }
 
 func (a *Adapter) recoveryBlocked() bool {
@@ -605,11 +611,11 @@ func (a *Adapter) recoveryBlocked() bool {
 	return a.recoveryFailed
 }
 
-func (a *Adapter) restoreGroups(ctx context.Context, jwt string, id int64, original []int64) error {
-	if err := a.updateAccountGroups(ctx, jwt, id, original); err != nil {
+func (a *Adapter) restoreGroups(ctx context.Context, token probeToken, id int64, original []int64) error {
+	if err := a.updateAccountGroups(ctx, token(), id, original); err != nil {
 		return err
 	}
-	row, err := a.accountDetail(ctx, jwt, id)
+	row, err := a.accountDetail(ctx, token(), id)
 	if err != nil {
 		return err
 	}
@@ -619,7 +625,7 @@ func (a *Adapter) restoreGroups(ctx context.Context, jwt string, id int64, origi
 	return nil
 }
 
-func (a *Adapter) probeGroupTransaction(ctx context.Context, jwt string, id int64, fn func(context.Context) error) (err error) {
+func (a *Adapter) probeGroupTransaction(ctx context.Context, token probeToken, id int64, promptCount int, fn func(context.Context, int) error) (err error) {
 	if a.recoveryBlocked() {
 		return gate("GROUP_RECOVERY_BLOCKED", "上一次账号分组恢复失败，已阻止后续分组变更")
 	}
@@ -631,58 +637,67 @@ func (a *Adapter) probeGroupTransaction(ctx context.Context, jwt string, id int6
 	if a.recoveryBlocked() {
 		return gate("GROUP_RECOVERY_BLOCKED", "上一次账号分组恢复失败，已阻止后续分组变更")
 	}
-	groupID, err := a.findProbeGroup(ctx, jwt)
+	if err := ctx.Err(); err != nil {
+		return httpFailure(ctx, err, "检测 ")
+	}
+	started := time.Now()
+	row, err := a.accountDetail(ctx, token(), id)
 	if err != nil {
 		return err
 	}
-	row, err := a.accountDetail(ctx, jwt, id)
+	if reason := row.eligibility(time.Now()); reason != "" {
+		return gate("ACCOUNT_UNAVAILABLE", reason)
+	}
+	concurrency := promptCount
+	if *row.Limit > 0 {
+		concurrency = min(concurrency, *row.Limit-*row.Busy)
+		if concurrency <= 0 {
+			return errAccountFull
+		}
+	}
+	ctx, cancel := context.WithDeadline(ctx, started.Add(probeBatchTimeout(a.requestTimeout, promptCount, concurrency)))
+	defer cancel()
+	groupID, err := a.findProbeGroup(ctx, token())
 	if err != nil {
 		return err
 	}
 	original := copyGroups(row.GroupIDs)
 	if containsGroup(original, groupID) {
-		return fn(ctx)
+		return fn(ctx, concurrency)
 	}
 	expected := append(copyGroups(original), groupID)
-	restoreNeeded := true
-	defer func() {
-		if !restoreNeeded {
-			return
+	err = a.updateAccountGroups(ctx, token(), id, expected)
+	var rejection *GateError
+	if errors.As(err, &rejection) {
+		switch rejection.status {
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+			return err
 		}
+	}
+	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
-		if restoreErr := a.restoreGroups(cleanupCtx, jwt, id, original); restoreErr != nil {
-			a.markRecoveryFailed()
+		if restoreErr := a.restoreGroups(cleanupCtx, token, id, original); restoreErr != nil {
+			a.markRecoveryFailed(id, restoreErr)
 			err = gate("GROUP_RESTORE_FAILED", "账号原分组恢复失败，已阻止后续分组变更")
 		}
 	}()
-	if err := a.updateAccountGroups(ctx, jwt, id, expected); err != nil {
+	if err != nil {
 		return err
 	}
-	attached, err := a.accountDetail(ctx, jwt, id)
+	attached, err := a.accountDetail(ctx, token(), id)
 	if err != nil {
 		return err
 	}
 	if !sameGroupSet(attached.GroupIDs, expected) || !containsGroup(attached.GroupIDs, groupID) {
 		return gate("GROUP_ATTACH_FAILED", "账号加入 Probe 分组后核对不一致，未向模型发题")
 	}
-	return fn(ctx)
-}
-
-func (a *Adapter) groupTransaction(ctx context.Context, jwt string, id int64, fn func(context.Context) (ProbeAnswer, error)) (answer ProbeAnswer, err error) {
-	err = a.probeGroupTransaction(ctx, jwt, id, func(ctx context.Context) error {
-		answer, err = fn(ctx)
-		return err
-	})
-	if err != nil {
-		return ProbeAnswer{}, err
-	}
-	return answer, nil
+	return fn(ctx, concurrency)
 }
 
 type probeBatchReporter func(index int, answer ProbeAnswer, err error)
 
-func (a *Adapter) ProbeBatch(ctx context.Context, jwt string, id int64, prompts []string, report probeBatchReporter) error {
+func (a *Adapter) ProbeBatch(ctx context.Context, token probeToken, id int64, prompts []string, report probeBatchReporter) error {
 	if id <= 0 || len(prompts) == 0 || len(prompts) > 3 {
 		return gate("INVALID", "账号或题目无效")
 	}
@@ -694,26 +709,7 @@ func (a *Adapter) ProbeBatch(ctx context.Context, jwt string, id int64, prompts 
 	if a.probeKey == "" {
 		return gate("CONFIG", "检测器未配置 Probe API Key")
 	}
-	row, err := a.accountDetail(ctx, jwt, id)
-	if err != nil {
-		return err
-	}
-	if reason := row.eligibility(time.Now()); reason != "" {
-		return gate("ACCOUNT_UNAVAILABLE", reason)
-	}
-	concurrency := len(prompts)
-	if *row.Limit > 0 {
-		available := *row.Limit - *row.Busy
-		if available <= 0 {
-			return errAccountFull
-		}
-		if available < concurrency {
-			concurrency = available
-		}
-	}
-	batchCtx, cancel := context.WithTimeout(ctx, probeBatchTimeout(a.requestTimeout, len(prompts), concurrency))
-	defer cancel()
-	return a.probeGroupTransaction(batchCtx, jwt, id, func(ctx context.Context) error {
+	return a.probeGroupTransaction(ctx, token, id, len(prompts), func(ctx context.Context, concurrency int) error {
 		var workers sync.WaitGroup
 		sem := make(chan struct{}, concurrency)
 		for index, prompt := range prompts {
@@ -742,29 +738,25 @@ func (a *Adapter) ProbeBatch(ctx context.Context, jwt string, id int64, prompts 
 	})
 }
 
-func (a *Adapter) Probe(ctx context.Context, jwt string, id int64, prompt string) (ProbeAnswer, error) {
-	var empty ProbeAnswer
+func (a *Adapter) Probe(ctx context.Context, token probeToken, id int64, prompt string) (ProbeAnswer, error) {
 	if id <= 0 || len(prompt) == 0 || len(prompt) > 8192 {
-		return empty, gate("INVALID", "账号或题目无效")
+		return ProbeAnswer{}, gate("INVALID", "账号或题目无效")
 	}
 	if a.probeKey == "" {
-		return empty, gate("CONFIG", "检测器未配置 Probe API Key")
+		return ProbeAnswer{}, gate("CONFIG", "检测器未配置 Probe API Key")
 	}
-	ctx, cancel := context.WithTimeout(ctx, a.requestTimeout)
-	defer cancel()
-	row, err := a.accountDetail(ctx, jwt, id)
-	if err != nil {
-		return empty, err
-	}
-	if reason := row.eligibility(time.Now()); reason != "" {
-		return empty, gate("ACCOUNT_UNAVAILABLE", reason)
-	}
-	if *row.Limit > 0 && *row.Busy >= *row.Limit {
-		return empty, errAccountFull
-	}
-	return a.groupTransaction(ctx, jwt, id, func(ctx context.Context) (ProbeAnswer, error) {
-		return a.gatewayProbe(ctx, prompt)
+	var answer ProbeAnswer
+	err := a.probeGroupTransaction(ctx, token, id, 1, func(ctx context.Context, _ int) error {
+		requestCtx, cancel := context.WithTimeout(ctx, a.requestTimeout)
+		defer cancel()
+		var err error
+		answer, err = a.gatewayProbe(requestCtx, prompt)
+		return err
 	})
+	if err != nil {
+		return ProbeAnswer{}, err
+	}
+	return answer, nil
 }
 
 func (a *Adapter) gatewayProbe(ctx context.Context, prompt string) (ProbeAnswer, error) {
@@ -808,7 +800,7 @@ func (a *Adapter) gatewayProbeOnce(ctx context.Context, prompt string) (ProbeAns
 	if err != nil {
 		return ProbeAnswer{}, gate("INVALID", "请求格式无效")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.gateway+"/v1/responses", strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.gateway+"/v1/responses", bytes.NewReader(body))
 	if err != nil {
 		return ProbeAnswer{}, gate("CONFIG", "Sub2API 地址无效")
 	}
@@ -829,6 +821,9 @@ func (a *Adapter) gatewayProbeOnce(ctx context.Context, prompt string) (ProbeAns
 		case http.StatusTooManyRequests:
 			return ProbeAnswer{}, gate("PROBE_LIMIT", "Probe 分组请求过于频繁，请稍后重试")
 		case http.StatusServiceUnavailable:
+			if n := resp.ContentLength; n > 0 && n <= 4096 {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, n))
+			}
 			return ProbeAnswer{}, gate("PROBE_NO_ACCOUNT", "Probe 分组当前没有可用账号，模型请求返回 HTTP 503")
 		case http.StatusBadRequest:
 			return ProbeAnswer{}, upstreamBadRequest(resp)
@@ -836,7 +831,7 @@ func (a *Adapter) gatewayProbeOnce(ctx context.Context, prompt string) (ProbeAns
 			return ProbeAnswer{}, gate("UPSTREAM_HTTP", fmt.Sprintf("模型网关返回 HTTP %d", resp.StatusCode))
 		}
 	}
-	answer, err := readProbeStream(resp.Body)
+	answer, err := readProbeStream(ctx, resp.Body)
 	if err != nil {
 		return ProbeAnswer{}, err
 	}
@@ -1066,14 +1061,15 @@ type responseEvent struct {
 	} `json:"response"`
 }
 
-func readProbeStream(reader io.Reader) (ProbeAnswer, error) {
+func readProbeStream(ctx context.Context, reader io.Reader) (ProbeAnswer, error) {
 	var empty ProbeAnswer
 	incomplete := gate("UPSTREAM_INCOMPLETE", "上游响应未完整结束，本题未计分")
 	refusal := gate("UPSTREAM_REFUSAL", "上游拒答或返回工具内容，本题未计分")
 	large := gate("UPSTREAM_SIZE", "上游响应超过大小限制")
 	limited := &io.LimitedReader{R: reader, N: (2 << 20) + 1}
 	scanner := bufio.NewScanner(limited)
-	scanner.Buffer(make([]byte, 4096), 128<<10)
+	const maxFrame = 512 << 10
+	scanner.Buffer(make([]byte, 4096), maxFrame)
 	var delta, frame strings.Builder
 	var streamedAnswer string
 	var sawItem bool
@@ -1081,7 +1077,7 @@ func readProbeStream(reader io.Reader) (ProbeAnswer, error) {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data:") {
 			fragment := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
-			if frame.Len()+len(fragment)+1 > 128<<10 {
+			if frame.Len()+len(fragment)+1 > maxFrame {
 				return empty, large
 			}
 			frame.WriteString(fragment)
@@ -1130,7 +1126,10 @@ func readProbeStream(reader io.Reader) (ProbeAnswer, error) {
 			}
 			delta.WriteString(ev.Delta)
 		case "response.completed":
-			if limited.N <= 0 || ev.Response.Status != "completed" {
+			if limited.N <= 0 {
+				return empty, large
+			}
+			if ev.Response.Status != "completed" {
 				return empty, incomplete
 			}
 			var result string
@@ -1163,6 +1162,12 @@ func readProbeStream(reader io.Reader) (ProbeAnswer, error) {
 			}
 			return ProbeAnswer{Text: result, Model: label}, nil
 		}
+	}
+	if limited.N <= 0 || errors.Is(scanner.Err(), bufio.ErrTooLong) {
+		return empty, large
+	}
+	if err := scanner.Err(); err != nil || ctx.Err() != nil {
+		return empty, httpFailure(ctx, err, "模型网关 ")
 	}
 	return empty, incomplete
 }

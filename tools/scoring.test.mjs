@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { analyzeGlobalOutputs } from "../web/fingerprint-core.js";
-import { accountReports, scoreAccount } from "../web/results.js";
+import { accountReports, loadBank, scoreAccount } from "../web/results.js";
 
 const asset = (name) => readFile(new URL(`../web/${name}`, import.meta.url));
 const bankBytes = await asset("unified_bank.json");
@@ -49,6 +49,18 @@ test("vendored bank and scorer match the pinned ModelTrace revision", async () =
   ];
   for (const [bytes, digest] of hashes)
     assert.equal(createHash("sha256").update(bytes).digest("hex"), digest);
+});
+
+test("the bank loader requests the bundled file by content hash under the app path", async (t) => {
+  const originalDocument = globalThis.document;
+  const baseURI = "https://example.test/modeltrace/";
+  globalThis.document = { baseURI };
+  t.after(() => { globalThis.document = originalDocument; });
+  const fetchBank = t.mock.method(globalThis, "fetch", async () => new Response(bankBytes));
+  assert.deepEqual(await loadBank(), bank);
+  const hash = createHash("sha256").update(bankBytes).digest("hex");
+  assert.equal(fetchBank.mock.callCount(), 1);
+  assert.equal(fetchBank.mock.calls[0].arguments[0].href, `${baseURI}unified_bank.json?v=${hash}`);
 });
 
 test("one, two and three answers match all of the original scorer outputs", () => {

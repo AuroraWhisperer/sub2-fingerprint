@@ -63,19 +63,26 @@ type Row struct {
 }
 type Run struct {
 	Summary
-	End         string     `json:"end,omitempty"`
-	BankVersion string     `json:"bank_version"`
-	Parallel    int        `json:"parallel"`
-	Questions   []Question `json:"questions"`
-	Rows        []Row      `json:"rows"`
+	End         string      `json:"end,omitempty"`
+	BankVersion string      `json:"bank_version"`
+	Parallel    int         `json:"parallel"`
+	Questions   []Question  `json:"questions"`
+	Rows        []Row       `json:"rows"`
+	Failure     *runFailure `json:"failure,omitempty"`
+}
+type runFailure struct {
+	AccountID int64  `json:"account_id"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
 }
 type ownedRun struct {
 	owner int64
 	epoch string
 	Run
 }
-type probeFunc func(context.Context, string, int64, string) (ProbeAnswer, error)
-type probeBatchFunc func(context.Context, string, int64, []string, probeBatchReporter) error
+type probeToken func() string
+type probeFunc func(context.Context, probeToken, int64, string) (ProbeAnswer, error)
+type probeBatchFunc func(context.Context, probeToken, int64, []string, probeBatchReporter) error
 type queue struct {
 	mu         sync.Mutex
 	version    string
@@ -186,7 +193,7 @@ func (q *queue) known(owner int64, req RunRequest) (bool, error) {
 	defer q.mu.Unlock()
 	return q.knownLocked(owner, req)
 }
-func (q *queue) start(parent context.Context, owner int64, jwt string, req RunRequest, accounts map[int64]AccountView, qs []Question) error {
+func (q *queue) start(parent context.Context, owner int64, token probeToken, req RunRequest, accounts map[int64]AccountView, qs []Question) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if ok, e := q.knownLocked(owner, req); ok {
@@ -194,6 +201,9 @@ func (q *queue) start(parent context.Context, owner int64, jwt string, req RunRe
 	}
 	if q.stopping {
 		return errors.New("检测服务正在关闭")
+	}
+	if parent.Err() != nil {
+		return errors.New("页面会话已结束，请刷新后重试")
 	}
 	if len(q.seen) >= maxSeenSubmissions {
 		return errors.New("本次启动已经达到批次数量上限，请在服务重新启动后重试")
@@ -223,7 +233,7 @@ func (q *queue) start(parent context.Context, owner int64, jwt string, req RunRe
 	q.current = r
 	q.cancel = cancel
 	q.wg.Add(1)
-	go q.execute(ctx, jwt, r)
+	go q.execute(ctx, token, r)
 	return nil
 }
 
@@ -250,7 +260,7 @@ func (s *accountSlot) release() {
 	}
 }
 
-func (q *queue) execute(ctx context.Context, jwt string, r *ownedRun) {
+func (q *queue) execute(ctx context.Context, token probeToken, r *ownedRun) {
 	defer q.wg.Done()
 	slots := make(chan struct{}, r.Parallel)
 	var workers sync.WaitGroup
@@ -264,11 +274,11 @@ func (q *queue) execute(ctx context.Context, jwt string, r *ownedRun) {
 			defer workers.Done()
 			defer slot.release()
 			if q.probeBatch != nil && len(r.Questions) > 1 {
-				q.doBatch(ctx, jwt, r, a*len(r.Questions), slot)
+				q.doBatch(ctx, token, r, a*len(r.Questions), slot)
 				return
 			}
 			for k, question := range r.Questions {
-				if !q.doRow(ctx, jwt, r, a*len(r.Questions)+k, question, slot) {
+				if !q.doRow(ctx, token, r, a*len(r.Questions)+k, question, slot) {
 					break
 				}
 			}
@@ -280,6 +290,12 @@ func (q *queue) execute(ctx context.Context, jwt string, r *ownedRun) {
 	state := "done"
 	if q.stopping {
 		state = "interrupted"
+	} else if r.Failure != nil {
+		for i := range r.Rows {
+			if nonterminal(r.Rows[i].Status) {
+				skipRow(&r.Rows[i], r.Failure)
+			}
+		}
 	} else if ctx.Err() != nil {
 		state = "cancelled"
 	}
@@ -287,7 +303,7 @@ func (q *queue) execute(ctx context.Context, jwt string, r *ownedRun) {
 	q.cancel()
 	q.cancel = nil
 }
-func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, question Question, slot *accountSlot) bool {
+func (q *queue) doRow(ctx context.Context, token probeToken, r *ownedRun, i int, question Question, slot *accountSlot) bool {
 	q.mu.Lock()
 	if ctx.Err() != nil {
 		q.mu.Unlock()
@@ -298,36 +314,11 @@ func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, quest
 	row.Started = nowStamp()
 	r.State = "running"
 	q.mu.Unlock()
-	answer, err := q.probeWhenReady(ctx, jwt, row, question, slot)
+	answer, err := q.probeWhenReady(ctx, token, row, question, slot)
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	row.Ended = nowStamp()
-	switch {
-	case ctx.Err() != nil:
-		row.Status = "cancelled"
-		if q.stopping {
-			row.Status = "interrupted"
-		}
-	case errors.Is(err, context.DeadlineExceeded):
-		row.Status = "failed"
-		row.Code = "TIMEOUT"
-		row.Error = "单题已超时"
-	case err != nil:
-		row.Status = "failed"
-		row.Error = "上游请求失败"
-		var ge *GateError
-		if errors.As(err, &ge) {
-			row.Code = ge.Code
-			row.Error = ge.Text
-		}
-	case answer.Text == "" || len(answer.Text) > maxRowsText:
-		row.Status = "failed"
-		row.Error = "回答为空或超出本题长度上限"
-	default:
-		row.Status = "done"
-		row.Text = answer.Text
-		row.Model = answer.Model
-	}
+	q.finishRow(ctx, r, i, answer, err)
+	q.stopOnFailure(ctx, r, row.AccountID, err)
 	// A refusal or an incomplete answer belongs to this question. Keep trying the other selected questions.
 	if row.Status == "failed" && stopsAccount(row.Code) {
 		for j := i + 1; j < len(r.Rows) && r.Rows[j].AccountID == row.AccountID; j++ {
@@ -341,7 +332,7 @@ func (q *queue) doRow(ctx context.Context, jwt string, r *ownedRun, i int, quest
 	return ctx.Err() == nil
 }
 
-func (q *queue) doBatch(ctx context.Context, jwt string, r *ownedRun, start int, slot *accountSlot) {
+func (q *queue) doBatch(ctx context.Context, token probeToken, r *ownedRun, start int, slot *accountSlot) {
 	q.mu.Lock()
 	if ctx.Err() != nil {
 		q.mu.Unlock()
@@ -360,34 +351,41 @@ func (q *queue) doBatch(ctx context.Context, jwt string, r *ownedRun, start int,
 		prompts[i] = question.Prompt
 	}
 	accountID := r.Rows[start].AccountID
+	var fatal error
 	report := func(index int, answer ProbeAnswer, err error) {
 		q.mu.Lock()
 		defer q.mu.Unlock()
 		if index < 0 || index >= len(r.Questions) {
 			return
 		}
-		q.finishBatchRow(ctx, r, start+index, answer, err)
+		q.finishRow(ctx, r, start+index, answer, err)
+		if fatal == nil && stopsRun(gateCode(err)) {
+			fatal = err
+		}
 	}
-	err := q.probeBatchWhenReady(ctx, jwt, r, start, accountID, prompts, slot, report)
+	err := q.probeBatchWhenReady(ctx, token, r, start, accountID, prompts, slot, report)
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if err == nil {
-		return
-	}
-	for i := range r.Questions {
-		row := &r.Rows[start+i]
-		if !nonterminal(row.Status) {
-			continue
+	if err != nil {
+		for i := range r.Questions {
+			if nonterminal(r.Rows[start+i].Status) {
+				q.finishRow(ctx, r, start+i, ProbeAnswer{}, err)
+			}
 		}
-		q.finishBatchRow(ctx, r, start+i, ProbeAnswer{}, err)
 	}
+	if stopsRun(gateCode(err)) {
+		fatal = err
+	}
+	q.stopOnFailure(ctx, r, accountID, fatal)
 }
 
-func (q *queue) finishBatchRow(ctx context.Context, r *ownedRun, index int, answer ProbeAnswer, err error) {
+func (q *queue) finishRow(ctx context.Context, r *ownedRun, index int, answer ProbeAnswer, err error) {
 	row := &r.Rows[index]
 	row.Ended = nowStamp()
 	switch {
-	case ctx.Err() != nil || q.stopping:
+	case ctx.Err() != nil && r.Failure != nil && !q.stopping:
+		skipRow(row, r.Failure)
+	case (ctx.Err() != nil || q.stopping) && gateCode(err) != "GROUP_RESTORE_FAILED":
 		row.Status = "cancelled"
 		if q.stopping {
 			row.Status = "interrupted"
@@ -414,17 +412,54 @@ func (q *queue) finishBatchRow(ctx context.Context, r *ownedRun, index int, answ
 	}
 }
 
+func skipRow(row *Row, failure *runFailure) {
+	row.Status = "failed"
+	row.Code = failure.Code
+	row.Error = "批次已停止：" + failure.Message
+	row.Ended = nowStamp()
+}
+
+func gateCode(err error) string {
+	var ge *GateError
+	if errors.As(err, &ge) {
+		return ge.Code
+	}
+	return ""
+}
+
+func stopsRun(code string) bool {
+	switch code {
+	case "GROUP_RESTORE_FAILED", "GROUP_RECOVERY_BLOCKED", "GROUP_NOT_FOUND", "GROUP_AMBIGUOUS",
+		"PROBE_KEY_INVALID", "PROBE_FORBIDDEN", "UNAUTHORIZED", "STEP_UP_REQUIRED", "CONFIG":
+		return true
+	default:
+		return false
+	}
+}
+
+// Called under q.mu after the account transaction has finished its cleanup.
+func (q *queue) stopOnFailure(ctx context.Context, r *ownedRun, accountID int64, err error) {
+	var ge *GateError
+	if !errors.As(err, &ge) || !stopsRun(ge.Code) {
+		return
+	}
+	if ge.Code == "GROUP_RESTORE_FAILED" || (ctx.Err() == nil && r.Failure == nil) {
+		r.Failure = &runFailure{accountID, ge.Code, ge.Text}
+		q.cancel()
+	}
+}
+
 const capacityPollInterval = 5 * time.Second
 const capacityWaitLimit = 5 * time.Minute
 
 var errCapacityTimeout = gate("CAPACITY_TIMEOUT", "等待账号空位已达 5 分钟，本题未发送")
 
-func (q *queue) probeWhenReady(ctx context.Context, jwt string, row *Row, question Question, slot *accountSlot) (ProbeAnswer, error) {
+func (q *queue) probeWhenReady(ctx context.Context, token probeToken, row *Row, question Question, slot *accountSlot) (ProbeAnswer, error) {
 	var waitCtx context.Context
 	for {
-		deadline, cancel := context.WithTimeout(ctx, 120*time.Second)
-		answer, err := q.probe(deadline, jwt, row.AccountID, question.Prompt)
-		if deadline.Err() != nil {
+		deadline, cancel := context.WithTimeout(ctx, maxProbeBatchTimeout(1))
+		answer, err := q.probe(deadline, token, row.AccountID, question.Prompt)
+		if deadline.Err() != nil && gateCode(err) != "GROUP_RESTORE_FAILED" {
 			err = deadline.Err()
 		}
 		cancel()
@@ -455,12 +490,12 @@ func (q *queue) probeWhenReady(ctx context.Context, jwt string, row *Row, questi
 	}
 }
 
-func (q *queue) probeBatchWhenReady(ctx context.Context, jwt string, r *ownedRun, start int, accountID int64, prompts []string, slot *accountSlot, report probeBatchReporter) error {
+func (q *queue) probeBatchWhenReady(ctx context.Context, token probeToken, r *ownedRun, start int, accountID int64, prompts []string, slot *accountSlot, report probeBatchReporter) error {
 	var waitCtx context.Context
 	for {
 		deadline, cancel := context.WithTimeout(ctx, maxProbeBatchTimeout(len(prompts)))
-		err := q.probeBatch(deadline, jwt, accountID, prompts, report)
-		if deadline.Err() != nil {
+		err := q.probeBatch(deadline, token, accountID, prompts, report)
+		if deadline.Err() != nil && gateCode(err) != "GROUP_RESTORE_FAILED" {
 			err = deadline.Err()
 		}
 		cancel()

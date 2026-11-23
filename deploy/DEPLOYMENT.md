@@ -15,10 +15,10 @@ SUB2_URL='http://127.0.0.1:8080'
 PROBE_API_KEY='在此填入 Probe 分组的 API Key'
 curl -sS --max-time 8 -o /dev/null -w 'Sub2API HTTP %{http_code}\n' \
   "$SUB2_URL/api/v1/admin/accounts?page=1&page_size=1&lite=1"
-sudo sh ./install.sh --check --sub2-url "$SUB2_URL" \
-  --probe-api-key "$PROBE_API_KEY" --probe-group-name Probe
-sudo sh ./install.sh --sub2-url "$SUB2_URL" \
-  --probe-api-key "$PROBE_API_KEY" --probe-group-name Probe
+printf '%s\n' "$PROBE_API_KEY" | sudo sh ./install.sh --check \
+  --sub2-url "$SUB2_URL" --probe-api-key-stdin --probe-group-name Probe
+printf '%s\n' "$PROBE_API_KEY" | sudo sh ./install.sh \
+  --sub2-url "$SUB2_URL" --probe-api-key-stdin --probe-group-name Probe
 ```
 
 上述未授权的管理 API 请求应返回 `401`。外部站点使用 HTTPS。安装会建立专用系统账号、两个 systemd 单元和一个回环监听。程序与配置位于 `/opt/sub2-fingerprint`，检测页会话仅在服务内存和浏览器临时 cookie 中存在。

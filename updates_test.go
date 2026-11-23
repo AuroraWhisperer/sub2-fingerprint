@@ -57,6 +57,47 @@ func TestUpdateEndpointsRequireAdminAndCSRF(t *testing.T) {
 	}
 }
 
+func TestSlowUpdateCheckDoesNotBlockSameSessionStatus(t *testing.T) {
+	a, b, _ := updateFixture(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		fmt.Fprint(w, `{"tag_name":"v99.0.0"}`)
+	}))
+	t.Cleanup(panel.Close)
+	a.updater.latestURL = panel.URL
+	checking := *b
+	checked := make(chan struct{})
+	go func() {
+		defer close(checked)
+		checking.post("/api/update/check", struct{}{})
+	}()
+	defer func() {
+		close(release)
+		<-checked
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("release check did not reach the fixture")
+	}
+
+	status := make(chan int, 1)
+	go func() {
+		code, _, _ := b.call("GET", "/api/update", nil, "")
+		status <- code
+	}()
+	select {
+	case code := <-status:
+		if code != http.StatusOK {
+			t.Fatal(code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("release check blocked the same session's status request")
+	}
+}
+
 func TestUpdateRequestBlocksDetectionAndDeduplicates(t *testing.T) {
 	a, b, _ := updateFixture(t)
 	if code, body, _ := b.post("/api/update/check", struct{}{}); code != 200 || body["latest"] != "v99.0.0" || body["available"] != true {

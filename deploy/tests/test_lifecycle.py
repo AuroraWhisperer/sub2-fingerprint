@@ -219,6 +219,10 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(live.call_count,2)
         self.assertEqual(self.active,{d.UNIT})
         self.assertEqual(self.enabled,{d.UNIT})
+        self.assertEqual(self.commands[-2:], [
+            ('systemctl', 'reset-failed', d.UNIT.name),
+            ('systemctl', 'start', d.UNIT.name),
+        ])
         self.assertEqual(run.read_bytes(),b'v0.1 answers')
         self.assertEqual(d.MARKER.read_bytes(),manifest)
         self.assertEqual(d.UNIT.read_bytes(),unit)
@@ -242,7 +246,16 @@ class Lifecycle(unittest.TestCase):
     def test_failed_socket_update_preserves_remembered_session(self):
         session=self.install()
         stamp=d.MARKER.read_bytes()
-        with patch.object(u,'health',side_effect=[ValueError('bad new health'),None]), self.assertRaises(ValueError):
+
+        def check_health():
+            if d.MARKER.read_bytes() != stamp:
+                raise ValueError('new service hit its start limit')
+            self.assertEqual(self.commands[-2:], [
+                ('systemctl', 'reset-failed', d.UNIT.name, d.SOCKET.name),
+                ('systemctl', 'start', d.SOCKET.name),
+            ])
+
+        with patch.object(u, 'health', side_effect=check_health), self.assertRaisesRegex(ValueError, 'new service hit its start limit'):
             self.apply()
         self.assertEqual(d.MARKER.read_bytes(),stamp)
         self.assertEqual(session.read_bytes(),b'fixture renewable session')

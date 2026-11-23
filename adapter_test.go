@@ -25,6 +25,8 @@ func assertGate(t *testing.T, err error, code string) {
 	}
 }
 
+func fixedJWT(jwt string) probeToken { return func() string { return jwt } }
+
 func TestAdapterAuthorizationContracts(t *testing.T) {
 	for _, bad := range []string{
 		"http://ordinary.example",
@@ -316,13 +318,43 @@ func TestProbeStreamScoresOnlyTheFinalAnswer(t *testing.T) {
 	frame := func(s string) string { return "data: " + s + "\n\n" }
 	streamed := frame(`{"type":"response.output_item.done","item":`+note+"}") + frame(`{"type":"response.output_item.done","item":`+final+"}")
 	for _, end := range []string{`[]`, `[` + note + `,` + final + `]`} {
-		answer, err := readProbeStream(strings.NewReader(streamed + frame(`{"type":"response.completed","response":{"status":"completed","model":"gpt-6-astra","output":`+end+"}}")))
+		answer, err := readProbeStream(context.Background(), strings.NewReader(streamed+frame(`{"type":"response.completed","response":{"status":"completed","model":"gpt-6-astra","output":`+end+"}}")))
 		if err != nil || answer.Text != "42" {
 			t.Fatalf("incorrect final answer: %q, %v", answer.Text, err)
 		}
 	}
-	_, err := readProbeStream(strings.NewReader(frame(`{"type":"response.output_text.delta","delta":"Thinking about 999"}`) + frame(`{"type":"response.completed","response":{"status":"completed","output":[`+note+`]}}`)))
+	_, err := readProbeStream(context.Background(), strings.NewReader(frame(`{"type":"response.output_text.delta","delta":"Thinking about 999"}`)+frame(`{"type":"response.completed","response":{"status":"completed","output":[`+note+`]}}`)))
 	assertGate(t, err, "UPSTREAM_INCOMPLETE")
+}
+
+type failedProbeStream struct{ err error }
+
+func (s failedProbeStream) Read([]byte) (int, error) { return 0, s.err }
+
+func TestProbeStreamClassifiesReadErrorsAndLargeFrames(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code string
+	}{
+		{context.DeadlineExceeded, "TIMEOUT"},
+		{context.Canceled, "CANCELED"},
+		{io.ErrUnexpectedEOF, "NETWORK"},
+		{io.EOF, "UPSTREAM_INCOMPLETE"},
+	} {
+		_, err := readProbeStream(context.Background(), failedProbeStream{tc.err})
+		assertGate(t, err, tc.code)
+	}
+	ctx := context.Background()
+	stream := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"42\",\"extra\":\"" +
+		strings.Repeat("x", 256<<10) + "\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+	if answer, err := readProbeStream(ctx, strings.NewReader(stream)); err != nil || answer.Text != "42" {
+		t.Fatalf("valid large frame: answer=%+v err=%v", answer, err)
+	}
+	_, err := readProbeStream(ctx, strings.NewReader(strings.Repeat("x", 513<<10)))
+	assertGate(t, err, "UPSTREAM_SIZE")
+	_, err = readProbeStream(ctx, strings.NewReader(strings.Repeat(": comment\n", 230000)))
+	assertGate(t, err, "UPSTREAM_SIZE")
 }
 
 func TestProbeGateway503IsClassifiedWithoutLeakingBody(t *testing.T) {

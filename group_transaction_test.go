@@ -24,7 +24,6 @@ type probeFixture struct {
 	currentGroups  []int64
 	updates        [][]int64
 	detailReads    int
-	verifyAt       int
 	verifyGroups   []int64
 	groups         []groupData
 	accountStatus  string
@@ -38,6 +37,9 @@ type probeFixture struct {
 	gatewayOnce    sync.Once
 	gatewayHandler func(http.ResponseWriter, *http.Request)
 	failRestore    bool
+	rejectAttach   int
+	restoreJWT     string
+	putCalls       int
 	requestPayload map[string]any
 	requestAuth    string
 	requestContent string
@@ -119,7 +121,7 @@ func (f *probeFixture) writeDetail(w http.ResponseWriter) {
 	f.mu.Lock()
 	f.detailReads++
 	groups := append([]int64(nil), f.currentGroups...)
-	if f.detailReads == f.verifyAt {
+	if len(f.updates) == 1 && f.verifyGroups != nil {
 		groups = append([]int64(nil), f.verifyGroups...)
 	}
 	row := f.accountMapLocked()
@@ -138,7 +140,19 @@ func (f *probeFixture) update(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.putCalls++
 	isRestore := reflect.DeepEqual(payload.GroupIDs, f.initialGroups)
+	if !isRestore && f.rejectAttach != 0 {
+		w.WriteHeader(f.rejectAttach)
+		if f.rejectAttach == http.StatusForbidden {
+			_, _ = w.Write([]byte(`{"code":"STEP_UP_REQUIRED"}`))
+		}
+		return
+	}
+	if isRestore && f.restoreJWT != "" && r.Header.Get("Authorization") != "Bearer "+f.restoreJWT {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
 	if isRestore && f.failRestore {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"code":"restore_failed"}`))
@@ -192,6 +206,15 @@ func (f *probeFixture) groupsSnapshot() []int64 {
 	return append([]int64(nil), f.currentGroups...)
 }
 
+func (f *probeFixture) checkDetailReads(want int) {
+	f.t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.detailReads != want {
+		f.t.Errorf("account detail reads: got %d, want %d", f.detailReads, want)
+	}
+}
+
 func (f *probeFixture) updateSnapshot() [][]int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -204,7 +227,7 @@ func (f *probeFixture) updateSnapshot() [][]int64 {
 
 func TestProbeGroupTransactionAddsVerifiesRequestsAndRestores(t *testing.T) {
 	f := newProbeFixture(t, []int64{2, 3})
-	answer, err := f.adapter.Probe(context.Background(), "admin-fixture", 1, "add 20 and 22")
+	answer, err := f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "add 20 and 22")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,6 +244,7 @@ func TestProbeGroupTransactionAddsVerifiesRequestsAndRestores(t *testing.T) {
 	if f.gatewayCalls.Load() != 1 {
 		t.Fatalf("expected one model request, got %d", f.gatewayCalls.Load())
 	}
+	f.checkDetailReads(3) // Initial state, verified attachment, verified restoration.
 	f.requestMu.Lock()
 	defer f.requestMu.Unlock()
 	if f.requestAuth != "Bearer probe-key" || f.requestContent != "add 20 and 22" {
@@ -273,7 +297,7 @@ func TestProbeBatchKeepsProbeMembershipUntilAllRequestsFinish(t *testing.T) {
 	results := make(chan result, 3)
 	done := make(chan error, 1)
 	go func() {
-		done <- f.adapter.ProbeBatch(context.Background(), "admin-fixture", 1,
+		done <- f.adapter.ProbeBatch(context.Background(), fixedJWT("admin-fixture"), 1,
 			[]string{"first", "second", "third"},
 			func(index int, answer ProbeAnswer, err error) {
 				results <- result{index: index, answer: answer, err: err}
@@ -316,6 +340,7 @@ func TestProbeBatchKeepsProbeMembershipUntilAllRequestsFinish(t *testing.T) {
 	if len(seen) != 3 || peak.Load() != 3 {
 		t.Fatalf("batch did not run three requests concurrently: seen=%v peak=%d", seen, peak.Load())
 	}
+	f.checkDetailReads(3)
 	if got := f.groupsSnapshot(); !reflect.DeepEqual(got, f.initialGroups) {
 		t.Fatalf("groups were not restored after batch: %v", got)
 	}
@@ -347,7 +372,7 @@ func TestProbeBatchRespectsAvailableAccountCapacity(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- f.adapter.ProbeBatch(context.Background(), "admin-fixture", 1,
+		done <- f.adapter.ProbeBatch(context.Background(), fixedJWT("admin-fixture"), 1,
 			[]string{"first", "second", "third"}, nil)
 	}()
 	select {
@@ -387,7 +412,7 @@ func TestProbeBatchUsesIndependentRequestTimeoutsForCapacityWaves(t *testing.T) 
 			}
 
 			results := make(chan error, 3)
-			err := f.adapter.ProbeBatch(context.Background(), "admin-fixture", 1,
+			err := f.adapter.ProbeBatch(context.Background(), fixedJWT("admin-fixture"), 1,
 				[]string{"first", "second", "third"},
 				func(_ int, _ ProbeAnswer, err error) {
 					results <- err
@@ -424,7 +449,7 @@ func TestProbeBatchRestoresAfterCancellation(t *testing.T) {
 	results := make(chan error, 3)
 	done := make(chan error, 1)
 	go func() {
-		done <- f.adapter.ProbeBatch(ctx, "admin-fixture", 1,
+		done <- f.adapter.ProbeBatch(ctx, fixedJWT("admin-fixture"), 1,
 			[]string{"first", "second", "third"},
 			func(_ int, _ ProbeAnswer, err error) {
 				results <- err
@@ -464,7 +489,7 @@ func TestProbeBatchRestoresAfterCancellation(t *testing.T) {
 
 func TestProbePreservesExistingProbeMembership(t *testing.T) {
 	f := newProbeFixture(t, []int64{2, 9})
-	if _, err := f.adapter.Probe(context.Background(), "admin-fixture", 1, "already attached"); err != nil {
+	if _, err := f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "already attached"); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.groupsSnapshot(); !reflect.DeepEqual(got, []int64{2, 9}) {
@@ -473,13 +498,13 @@ func TestProbePreservesExistingProbeMembership(t *testing.T) {
 	if len(f.updateSnapshot()) != 0 {
 		t.Fatalf("existing membership caused a mutation: %v", f.updateSnapshot())
 	}
+	f.checkDetailReads(1)
 }
 
 func TestProbeDoesNotCallGatewayWhenAttachVerificationFails(t *testing.T) {
 	f := newProbeFixture(t, []int64{2})
-	f.verifyAt = 3
 	f.verifyGroups = []int64{2}
-	_, err := f.adapter.Probe(context.Background(), "admin-fixture", 1, "must not send")
+	_, err := f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "must not send")
 	assertGate(t, err, "GROUP_ATTACH_FAILED")
 	if f.gatewayCalls.Load() != 0 {
 		t.Fatal("gateway was called before group attachment verification")
@@ -502,7 +527,7 @@ func TestProbeRestoresAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := f.adapter.Probe(ctx, "admin-fixture", 1, "cancel me")
+		_, err := f.adapter.Probe(ctx, fixedJWT("admin-fixture"), 1, "cancel me")
 		done <- err
 	}()
 	select {
@@ -527,23 +552,69 @@ func TestProbeRestoreFailureBlocksLaterMutations(t *testing.T) {
 	f := newProbeFixture(t, []int64{2})
 	f.gatewayStatus = http.StatusServiceUnavailable
 	f.failRestore = true
-	_, err := f.adapter.Probe(context.Background(), "admin-fixture", 1, "no account")
+	_, err := f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "no account")
 	assertGate(t, err, "GROUP_RESTORE_FAILED")
 	if f.adapter.recoveryFailed != true {
 		t.Fatal("recovery failure latch was not set")
 	}
 	updatesBefore := len(f.updateSnapshot())
-	_, err = f.adapter.Probe(context.Background(), "admin-fixture", 1, "blocked")
+	_, err = f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "blocked")
 	assertGate(t, err, "GROUP_RECOVERY_BLOCKED")
 	if len(f.updateSnapshot()) != updatesBefore {
 		t.Fatal("blocked transaction changed account groups")
 	}
 }
 
+func TestRejectedAttachDoesNotRestoreOrBlockLaterProbes(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		code   string
+	}{
+		{400, "ADMIN_DETAIL_BAD_REQUEST"},
+		{401, "UNAUTHORIZED"},
+		{403, "STEP_UP_REQUIRED"},
+		{404, "NOT_FOUND"},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			f := newProbeFixture(t, []int64{2})
+			f.rejectAttach = tc.status
+			_, err := f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "not sent")
+			assertGate(t, err, tc.code)
+			f.mu.Lock()
+			puts := f.putCalls
+			f.mu.Unlock()
+			if puts != 1 || f.adapter.recoveryBlocked() || f.gatewayCalls.Load() != 0 {
+				t.Fatalf("rejected attach triggered follow-up work: PUTs=%d", puts)
+			}
+		})
+	}
+}
+
+func TestProbeCleanupUsesRenewedJWT(t *testing.T) {
+	f := newProbeFixture(t, []int64{2})
+	f.restoreJWT = "renewed"
+	var renewed atomic.Bool
+	f.gatewayHandler = func(w http.ResponseWriter, _ *http.Request) {
+		renewed.Store(true)
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"42\"}\n\n",
+			"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n")
+	}
+	token := func() string {
+		if renewed.Load() {
+			return "renewed"
+		}
+		return "original"
+	}
+	answer, err := f.adapter.Probe(context.Background(), token, 1, "test")
+	if err != nil || answer.Text != "42" || !reflect.DeepEqual(f.groupsSnapshot(), []int64{2}) {
+		t.Fatalf("cleanup with renewed token failed: answer=%+v err=%v", answer, err)
+	}
+}
+
 func TestProbeNoAccount503IsReturnedAfterSuccessfulRecovery(t *testing.T) {
 	f := newProbeFixture(t, []int64{2})
 	f.gatewayStatus = http.StatusServiceUnavailable
-	_, err := f.adapter.Probe(context.Background(), "admin-fixture", 1, "no account")
+	_, err := f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "no account")
 	assertGate(t, err, "PROBE_NO_ACCOUNT")
 	if got := f.gatewayCalls.Load(); got != 5 {
 		t.Fatalf("expected five bounded attempts, got %d", got)
@@ -556,7 +627,7 @@ func TestProbeNoAccount503IsReturnedAfterSuccessfulRecovery(t *testing.T) {
 func TestProbeRejectsAmbiguousProbeGroup(t *testing.T) {
 	f := newProbeFixture(t, []int64{2})
 	f.groups = []groupData{{ID: 9, Name: "Probe"}, {ID: 10, Name: "Probe"}}
-	_, err := f.adapter.Probe(context.Background(), "admin-fixture", 1, "ambiguous")
+	_, err := f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "ambiguous")
 	assertGate(t, err, "GROUP_AMBIGUOUS")
 	if f.gatewayCalls.Load() != 0 || len(f.updateSnapshot()) != 0 {
 		t.Fatal("ambiguous Probe group caused a mutation or model request")

@@ -274,6 +274,9 @@ def recover(folder):
     restored = d.UNIT if legacy else d.SOCKET
     enable_as(restored, j['enabled'])
     if j['active']:
+        # Reload can preserve start limits. An unloaded unit has no counter to reset.
+        units = [d.UNIT.name] if legacy else [d.UNIT.name, d.SOCKET.name]
+        d.run('systemctl', 'reset-failed', *units, check=False)
         d.run('systemctl', 'start', restored.name)
         health()
     shutil.rmtree(folder)

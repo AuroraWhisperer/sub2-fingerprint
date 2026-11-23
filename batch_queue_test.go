@@ -10,7 +10,7 @@ import (
 )
 
 func TestQueueRunsOneAccountsQuestionsConcurrentlyWithBatchProbe(t *testing.T) {
-	q, err := openQueue("", "fixture", func(context.Context, string, int64, string) (ProbeAnswer, error) {
+	q, err := openQueue("", "fixture", func(context.Context, probeToken, int64, string) (ProbeAnswer, error) {
 		t.Fatal("queue used the single-question probe path")
 		return ProbeAnswer{}, nil
 	})
@@ -24,7 +24,7 @@ func TestQueueRunsOneAccountsQuestionsConcurrentlyWithBatchProbe(t *testing.T) {
 	var once sync.Once
 	var active atomic.Int32
 	var peak atomic.Int32
-	q.probeBatch = func(ctx context.Context, _ string, _ int64, prompts []string, report probeBatchReporter) error {
+	q.probeBatch = func(ctx context.Context, _ probeToken, _ int64, prompts []string, report probeBatchReporter) error {
 		var workers sync.WaitGroup
 		for index, prompt := range prompts {
 			workers.Add(1)
@@ -69,7 +69,7 @@ func TestQueueRunsOneAccountsQuestionsConcurrentlyWithBatchProbe(t *testing.T) {
 		{ID: "q2", Prompt: "second"},
 		{ID: "q3", Prompt: "third"},
 	}
-	if err := q.start(context.Background(), 7, "jwt", req, map[int64]AccountView{
+	if err := q.start(context.Background(), 7, fixedJWT("jwt"), req, map[int64]AccountView{
 		11: {ID: 11, Name: "fixture-account"},
 	}, questions); err != nil {
 		t.Fatal(err)
@@ -122,4 +122,56 @@ func TestProbeBatchTimeoutCoversCapacityLimitedWaves(t *testing.T) {
 	if got, want := maxProbeBatchTimeout(3), probeBatchTimeout(probeTimeout, 3, 1); got != want {
 		t.Fatalf("queue batch timeout=%s, want serial upper bound %s", got, want)
 	}
+}
+
+func TestBatchReportsRecoveryFailureAndSkipsOtherAccounts(t *testing.T) {
+	q, err := openQueue("", "fixture", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(q.close)
+	q.probeBatch = func(_ context.Context, _ probeToken, account int64, prompts []string, report probeBatchReporter) error {
+		if account != 11 {
+			t.Errorf("attempted account %d after the recovery failure", account)
+		}
+		for i := range prompts {
+			report(i, ProbeAnswer{Text: "42"}, nil)
+		}
+		return gate("GROUP_RESTORE_FAILED", "fixture restore failed")
+	}
+	req := RunRequest{ID: "11112222-0000-4000-8000-000000000062", Accounts: []int64{11, 22}, Parallel: 1}
+	qs := []Question{{ID: "q1", Prompt: "first"}, {ID: "q2", Prompt: "second"}}
+	if err := q.start(context.Background(), 7, fixedJWT("fixture"), req, map[int64]AccountView{11: {}, 22: {}}, qs); err != nil {
+		t.Fatal(err)
+	}
+	run := waitRun(t, q, 7, req.ID)
+	if run.Failure == nil || run.Failure.AccountID != 11 || run.Failure.Code != "GROUP_RESTORE_FAILED" {
+		t.Fatalf("missing batch recovery failure: %+v", run)
+	}
+	for i, row := range run.Rows {
+		if i < len(qs) {
+			if row.Status != "done" || row.Text != "42" {
+				t.Errorf("recovery failure overwrote answer: %+v", row)
+			}
+		} else if row.Status != "failed" || row.Started != "" {
+			t.Errorf("later account was not skipped: %+v", row)
+		}
+	}
+}
+
+func TestRecoveryFailureTakesPrecedenceOverProbeDeadline(t *testing.T) {
+	restoreFailure := gate("GROUP_RESTORE_FAILED", "fixture restore failed")
+	q := queue{
+		probe: func(context.Context, probeToken, int64, string) (ProbeAnswer, error) {
+			return ProbeAnswer{}, restoreFailure
+		},
+		probeBatch: func(context.Context, probeToken, int64, []string, probeBatchReporter) error {
+			return restoreFailure
+		},
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	_, err := q.probeWhenReady(ctx, fixedJWT("fixture"), &Row{}, Question{}, nil)
+	assertGate(t, err, "GROUP_RESTORE_FAILED")
+	assertGate(t, q.probeBatchWhenReady(ctx, fixedJWT("fixture"), nil, 0, 1, []string{"first", "second"}, nil, nil), "GROUP_RESTORE_FAILED")
 }

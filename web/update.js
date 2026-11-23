@@ -11,7 +11,8 @@ export function createUpdater(api, onChange, refreshSession) {
   let busy = false,
     timer,
     reconnectUntil = 0,
-    previousVersion = "";
+    previousVersion = "",
+    authRetried = false;
 
   function render() {
     panel.hidden = !loggedIn;
@@ -31,14 +32,17 @@ export function createUpdater(api, onChange, refreshSession) {
       document.getElementById("updateUnsupported").hidden = data.supported;
       document.getElementById("updateRestartHint").hidden =
         !data.supported || !data.available;
-      if (detectionActive && data.available && !busy)
+      if (detectionActive && data.available && !busy && !checking) {
         status.textContent = "检测进行中，完成后可更新";
+        status.classList.remove("error");
+      }
     }
   }
 
   function receive(next) {
     const wasBusy = busy;
     data = next;
+    authRetried = false;
     busy = ["queued", "running"].includes(data.state);
     status.textContent = data.message;
     if (!busy && data.state !== "failed" && data.latest)
@@ -57,12 +61,32 @@ export function createUpdater(api, onChange, refreshSession) {
     timer = setTimeout(poll, 2000);
   }
 
+  function reconnectMessage() {
+    status.textContent = "正在切换新版本并重连…";
+    status.classList.remove("error");
+    schedule();
+  }
+
+  function stopPolling(message) {
+    busy = false;
+    render();
+    onChange();
+    status.textContent = `${message} 请重连后重试。`;
+    status.classList.add("error");
+    document.getElementById("reconnect").hidden = false;
+  }
+
   async function poll() {
     if (!loggedIn) return;
     try {
       const next = await api("/api/update");
+      authRetried = false;
       if (busy && !["queued", "running"].includes(next.state)) {
-        if (!(await refreshSession())) return;
+        if (!(await refreshSession())) {
+          if (loggedIn && Date.now() < reconnectUntil) reconnectMessage();
+          else stopPolling("暂时无法同步页面会话。");
+          return;
+        }
       }
       receive(next);
       if (busy) schedule();
@@ -73,20 +97,24 @@ export function createUpdater(api, onChange, refreshSession) {
       )
         location.reload();
     } catch (error) {
-      if (
-        Date.now() < reconnectUntil &&
-        error.status !== 401 &&
-        error.status !== 403
-      ) {
-        status.textContent = "正在切换新版本并重连…";
-        schedule();
-      } else {
-        busy = false;
-        status.textContent = `${error.message} 请重连后重试。`;
-        status.classList.add("error");
-        render();
-        onChange();
+      const needsAuth = error.status === 401 || error.status === 403;
+      if (needsAuth && !authRetried) {
+        authRetried = true;
+        try {
+          await refreshSession();
+          if (loggedIn && Date.now() < reconnectUntil) {
+            reconnectMessage();
+            return;
+          }
+        } catch {
+          // The reconnect button remains available if session refresh fails.
+        }
       }
+      if (!needsAuth && Date.now() < reconnectUntil) {
+        reconnectMessage();
+        return;
+      }
+      stopPolling(error.message);
     }
   }
 
@@ -145,7 +173,7 @@ export function createUpdater(api, onChange, refreshSession) {
         panel.hidden = true;
         busy = false;
       }
-      if (detectionFinished && data) receive(data);
+      if (detectionFinished && data && !["queued", "running"].includes(data.state)) receive(data);
       else render();
     },
     async restore() {

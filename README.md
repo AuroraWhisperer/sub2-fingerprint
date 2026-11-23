@@ -10,20 +10,20 @@
 
 ```sh
 PROBE_API_KEY='在此填入 Probe 分组的 API Key'
-sudo sh ./install.sh --check --sub2-url http://127.0.0.1:8080 \
-  --probe-api-key "$PROBE_API_KEY" --probe-group-name Probe
-sudo sh ./install.sh --sub2-url http://127.0.0.1:8080 \
-  --probe-api-key "$PROBE_API_KEY" --probe-group-name Probe
+printf '%s\n' "$PROBE_API_KEY" | sudo sh ./install.sh --check \
+  --sub2-url http://127.0.0.1:8080 --probe-api-key-stdin --probe-group-name Probe
+printf '%s\n' "$PROBE_API_KEY" | sudo sh ./install.sh \
+  --sub2-url http://127.0.0.1:8080 --probe-api-key-stdin --probe-group-name Probe
 ```
 
 安装配置固定为 `parallel=1`。每批可以选择多个账号，账号之间依次执行。同一账号的多道题在一次 Probe 分组事务内按账号可用并发容量执行，全部请求结束后才恢复原始分组。Probe Key 写入受权限保护的配置文件，不进入检测结果和日志。
 
 已有旧版本的用户先按[运维说明](deploy/DEPLOYMENT.md)完成迁移。日常更新、恢复和卸载也按该说明执行。
 
-1. Windows 用户从同一发布页下载 `sub2-fingerprint-windows-amd64.zip`，双击 `Sub2-Fingerprint.exe`，启动器会打开服务器检测页 `https://lirahub.dpdns.org/modeltrace/`。
+1. Windows 用户从同一发布页下载 `sub2-fingerprint-windows-amd64.zip`，双击 `Sub2-Fingerprint.exe`，启动器会打开服务器检测页 `https://lirahub.dpdns.org/modeltrace/`。自部署可运行 `.\Sub2-Fingerprint.exe -url https://example.com/modeltrace/`，也可把 `-url` 加到快捷方式的目标中。
 2. 先在 Sub2API 管理后台登录管理员账号，再打开检测页。检测页会复用同站点的管理员会话，不再要求输入第二组邮箱和密码；原站要求二次验证时，按页面提示完成验证。
 3. 选择账号和一至三题，点击“开始检测”。检测器会为每个账号完成一次加组和核对，在账号容量允许的范围内并行发送所选题目，全部题目结束后恢复原始分组。切换账号时，Sub2API 调度缓存可能晚于管理接口更新；遇到 HTTP `503`，检测器会保持当前账号的 Probe 分组关系，按 1、2、4、8 秒间隔重试，最多发送 5 次，且仍受原请求超时和取消控制。成功的题目不会重复发送；重试后仍返回 `503` 才显示 Probe 分组没有可用账号。
-4. 整批结束后，结果页按账号和挑战显示原始答案并计算归因概率。答案只在检测进程和当前页面内存中使用。
+4. 检测期间，结果页按账号和挑战显示进度与已完成的原始答案。整批结束后计算归因概率。答案只在检测进程和当前页面内存中使用。
 
 ## 真实验收
 

@@ -50,10 +50,10 @@ type sub2 interface {
 	Logout(context.Context, string) error
 	StepUp(context.Context, string, string) error
 	List(context.Context, string) ([]AccountView, error)
-	Probe(context.Context, string, int64, string) (ProbeAnswer, error)
+	Probe(context.Context, probeToken, int64, string) (ProbeAnswer, error)
 }
 type batchProbe interface {
-	ProbeBatch(context.Context, string, int64, []string, probeBatchReporter) error
+	ProbeBatch(context.Context, probeToken, int64, []string, probeBatchReporter) error
 }
 type app struct {
 	stateDir    string
@@ -210,12 +210,26 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		if p == "/unified_bank.json" && r.URL.Query().Get("v") == a.bankVersion {
+			w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+		}
 		a.static.ServeHTTP(w, r)
 		return
 	}
 	s := a.lookup(r)
-	if s != nil {
-		defer s.mu.Unlock()
+	locked := s
+	defer func() {
+		if locked != nil {
+			locked.mu.Unlock()
+		}
+	}()
+	if r.Method == http.MethodPost {
+		mt, _, e := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		origin := r.Header.Get("Origin")
+		if e != nil || mt != "application/json" || (origin != "http://"+r.Host && origin != "https://"+r.Host) || s == nil || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-CSRF-Token")), []byte(s.csrf)) != 1 {
+			fail(w, 403, "CSRF", "页面会话已过期或来源不符，请刷新")
+			return
+		}
 	}
 	token := bearerToken(r.Header.Get("Authorization"))
 	if token != "" {
@@ -226,7 +240,7 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.mu.Lock()
-			defer s.mu.Unlock()
+			locked = s
 		} else if err := a.bindExternal(r.Context(), s, token); err != nil {
 			a.sharedAuthFailure(w, err)
 			return
@@ -240,14 +254,6 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s = nil
 		} else {
 			fail(w, http.StatusUnauthorized, "SUB2_SESSION", "请先登录 Sub2API 管理员账号")
-			return
-		}
-	}
-	if r.Method == "POST" {
-		mt, _, e := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		origin := r.Header.Get("Origin")
-		if e != nil || mt != "application/json" || (origin != "http://"+r.Host && origin != "https://"+r.Host) || s == nil || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-CSRF-Token")), []byte(s.csrf)) != 1 {
-			fail(w, 403, "CSRF", "页面会话已过期或来源不符，请刷新")
 			return
 		}
 	}
@@ -276,7 +282,7 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if s == nil {
 			var ok bool
-			s, ok = a.replace(w, nil, LoginResult{}, false)
+			s, ok = a.replace(w, nil, LoginResult{}, false, false)
 			if !ok {
 				return
 			}
@@ -297,6 +303,9 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "SESSION", "请先登录 Sub2API 管理员账号")
 		return
 	}
+	owner, jwt, credential := s.owner, s.jwt, s.probeJWT
+	locked.mu.Unlock()
+	locked = nil
 	switch p {
 	case "/api/update", "/api/update/check", "/api/update/install":
 		a.updateRoute(w, r)
@@ -304,9 +313,9 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !exactMethod(w, r, "GET") {
 			return
 		}
-		list, e := a.api.List(r.Context(), s.jwt)
+		list, e := a.api.List(r.Context(), jwt)
 		if e != nil {
-			a.sessionFailure(w, s, e)
+			a.sessionFailure(w, s, jwt, e)
 			return
 		}
 		respond(w, 200, map[string]any{"accounts": list})
@@ -314,22 +323,31 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !exactMethod(w, r, "GET") {
 			return
 		}
-		i, e := rand.Int(rand.Reader, big.NewInt(int64(len(a.groups))))
+		groups := a.groups
+		if previous := r.URL.Query().Get("previous"); previous != "" && len(groups) > 1 {
+			for i, group := range groups {
+				if group[0].ID == previous {
+					groups = append(append([][]Question(nil), groups[:i]...), groups[i+1:]...)
+					break
+				}
+			}
+		}
+		i, e := rand.Int(rand.Reader, big.NewInt(int64(len(groups))))
 		if e != nil {
 			fail(w, 503, "RANDOM", "暂不能生成题目")
 			return
 		}
-		respond(w, 200, map[string]any{"questions": a.groups[i.Int64()]})
+		respond(w, 200, map[string]any{"questions": groups[i.Int64()]})
 	case "/api/runs":
 		if r.Method == "GET" {
-			respond(w, 200, map[string]any{"runs": a.queue.history(s.owner)})
+			respond(w, 200, map[string]any{"runs": a.queue.history(owner)})
 			return
 		}
 		if exactMethod(w, r, "POST") {
-			a.submit(w, r, s)
+			a.submit(w, r, s, owner, func() string { return *credential.Load() })
 		}
 	default:
-		a.runDetail(w, r, s)
+		a.runDetail(w, r, owner)
 	}
 }
 func sixDigits(s string) bool {
@@ -353,7 +371,7 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 		if !decode(w, r, &empty) {
 			return
 		}
-		newSession, ok := a.replace(w, s, LoginResult{}, false)
+		newSession, ok := a.replace(w, s, LoginResult{}, false, false)
 		if !ok {
 			return
 		}
@@ -447,7 +465,7 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 	if info.Temp != "" {
 		info = LoginResult{Temp: info.Temp}
 	}
-	st, ok := a.replace(w, s, info, remember)
+	st, ok := a.replace(w, s, info, remember, false)
 	if !ok {
 		if info.Refresh != "" {
 			_ = a.api.Logout(r.Context(), info.Refresh)
@@ -456,11 +474,11 @@ func (a *app) auth(w http.ResponseWriter, r *http.Request, s *session) {
 	}
 	respond(w, 200, a.sessionView(st))
 }
-func (a *app) submit(w http.ResponseWriter, r *http.Request, s *session) {
+func (a *app) submit(w http.ResponseWriter, r *http.Request, s *session, owner int64, token probeToken) {
 	a.updater.mu.Lock()
-	defer a.updater.mu.Unlock()
-	update, err := a.updater.status()
-	if err != nil || updateBusy(update) {
+	ready := a.updater.detectionReady()
+	a.updater.mu.Unlock()
+	if !ready {
 		fail(w, 409, "UPDATE_ACTIVE", "程序正在更新或更新状态无法确认，请稍后再开始检测。")
 		return
 	}
@@ -495,7 +513,7 @@ func (a *app) submit(w http.ResponseWriter, r *http.Request, s *session) {
 		asked[id] = true
 		qs = append(qs, q)
 	}
-	if ok, err := a.queue.known(s.owner, req); ok {
+	if ok, err := a.queue.known(owner, req); ok {
 		if err != nil {
 			fail(w, 409, "SUBMISSION", "此提交编号已被使用")
 			return
@@ -503,22 +521,29 @@ func (a *app) submit(w http.ResponseWriter, r *http.Request, s *session) {
 		respond(w, 200, map[string]string{"id": req.ID})
 		return
 	}
-	accounts, err := a.api.List(r.Context(), s.jwt)
+	jwt := token()
+	accounts, err := a.api.List(r.Context(), jwt)
 	if err != nil {
-		a.sessionFailure(w, s, err)
+		a.sessionFailure(w, s, jwt, err)
 		return
 	}
 	byID := make(map[int64]AccountView, len(accounts))
 	for _, a := range accounts {
 		byID[a.ID] = a
 	}
-	if err = a.queue.start(s.ctx, s.owner, s.jwt, req, byID, qs); err != nil {
+	a.updater.mu.Lock()
+	defer a.updater.mu.Unlock()
+	if !a.updater.detectionReady() {
+		fail(w, 409, "UPDATE_ACTIVE", "程序正在更新或更新状态无法确认，请稍后再开始检测。")
+		return
+	}
+	if err = a.queue.start(s.ctx, owner, token, req, byID, qs); err != nil {
 		fail(w, 409, "CANNOT_START", err.Error())
 		return
 	}
 	respond(w, 202, map[string]string{"id": req.ID})
 }
-func (a *app) runDetail(w http.ResponseWriter, r *http.Request, s *session) {
+func (a *app) runDetail(w http.ResponseWriter, r *http.Request, owner int64) {
 	rest, found := strings.CutPrefix(r.URL.Path, "/api/runs/")
 	if !found {
 		http.NotFound(w, r)
@@ -541,7 +566,7 @@ func (a *app) runDetail(w http.ResponseWriter, r *http.Request, s *session) {
 		if !decode(w, r, &empty) {
 			return
 		}
-		if a.queue.stopRun(s.owner, id) != nil {
+		if a.queue.stopRun(owner, id) != nil {
 			fail(w, 404, "NOT_FOUND", errAbsent.Error())
 			return
 		}
@@ -551,7 +576,7 @@ func (a *app) runDetail(w http.ResponseWriter, r *http.Request, s *session) {
 	if !exactMethod(w, r, "GET") {
 		return
 	}
-	run, err := a.queue.get(s.owner, id)
+	run, err := a.queue.get(owner, id)
 	if err != nil {
 		if errors.Is(err, errAbsent) {
 			fail(w, 404, "NOT_FOUND", errAbsent.Error())

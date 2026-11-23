@@ -137,12 +137,24 @@
                   </button>
                 </div>
               </div>
+              <div class="account-filters">
+                <label class="field">
+                  <input type="search" id="accountSearch" aria-label="搜索账号" placeholder="搜索账号名或 ID" />
+                </label>
+                <label class="available-filter">
+                  <input type="checkbox" id="availableOnly" /> 仅看可用
+                </label>
+              </div>
               <div id="accounts" class="choices"></div>
+              <p id="accountNoMatches" class="empty" hidden>没有匹配的账号。</p>
             </fieldset>
             <fieldset>
               <div class="field-head">
                 <span class="field-title">挑战题</span>
                 <div class="field-actions">
+                  <button type="button" class="link" id="refreshQuestions" disabled>
+                    换一组题
+                  </button>
                   <button type="button" class="link" id="selectAllQuestions">
                     全选
                   </button>

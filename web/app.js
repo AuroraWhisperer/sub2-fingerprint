@@ -15,6 +15,9 @@ let session = {},
   pendingSubmit = null;
 let readyAccounts = false,
   readyQuestions = false;
+let accountRequest, sessionRequest, initializing;
+const accountLimit = 24;
+const pollRetryNotice = "连接暂时中断，正在重试检测进度…";
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const updates = createUpdater(api, updateStart, syncSession);
 const show = (id, yes) => {
@@ -27,14 +30,15 @@ function notice(text = "", error = false) {
   panel.hidden = !text;
   panel.classList.toggle("error", error);
 }
+function sharedToken() {
+  try {
+    return String(localStorage.getItem("auth_token") || "").trim();
+  } catch {
+    return "";
+  }
+}
 async function api(path, body) {
-  const token = (() => {
-    try {
-      return String(localStorage.getItem("auth_token") || "").trim();
-    } catch {
-      return "";
-    }
-  })();
+  const token = sharedToken();
   const options = {
     credentials: "same-origin",
     cache: "no-store",
@@ -52,7 +56,7 @@ async function api(path, body) {
   try {
     response = await fetch(new URL(path.replace(/^\/+/, ""), appRoot), options);
   } catch {
-    throw new Error("连接中断，请刷新页面。");
+    throw Object.assign(new Error("连接中断，请重试。"), { code: "NETWORK" });
   }
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
@@ -64,12 +68,18 @@ async function api(path, body) {
   }
   return data;
 }
-async function syncSession() {
+function syncSession() {
+  return (sessionRequest ??= readSession().finally(() => {
+    sessionRequest = null;
+  }));
+}
+async function readSession() {
   const previous = session;
   let current;
   try {
     current = await api("/api/session");
   } catch (error) {
+    if (session !== previous) return false;
     if (error.status === 401 && error.code === "SUB2_SESSION") {
       session = { logged_in: false };
       applySession();
@@ -150,6 +160,7 @@ function applySession() {
     lastRender = "";
     pendingSubmit = null;
     runActive = false;
+    accountRequest = null;
     readyAccounts = readyQuestions = false;
     for (const id of ["accounts", "questions", "result"])
       $(id).replaceChildren();
@@ -165,12 +176,18 @@ const checked = (root) =>
   );
 const enabledBoxes = (root) =>
   Array.from($(root).querySelectorAll("input:not(:disabled)"));
+function accountSelection() {
+  const boxes = enabledBoxes("accounts");
+  const selected = boxes.filter((box) => box.checked);
+  const add = boxes
+    .filter((box) => !box.checked && !box.closest(".choice").hidden)
+    .slice(0, Math.max(0, accountLimit - selected.length));
+  return { selected, add };
+}
 function syncToggleLabels() {
-  const acctBoxes = enabledBoxes("accounts");
-  const allAccts =
-    acctBoxes.length > 0 && acctBoxes.every((box) => box.checked);
-  $("selectAllAccounts").textContent = allAccts ? "清空" : "全选";
-  $("selectAllAccounts").disabled = acctBoxes.length === 0;
+  const { selected, add } = accountSelection();
+  $("selectAllAccounts").textContent = selected.length && !add.length ? "清空" : "全选";
+  $("selectAllAccounts").disabled = !selected.length && !add.length;
 
   const qBoxes = enabledBoxes("questions");
   const allQs = qBoxes.length > 0 && qBoxes.every((box) => box.checked);
@@ -191,7 +208,7 @@ function updateStart() {
   else if (!readyAccounts || !readyQuestions) reason = "加载中…";
   else if (!n && !enabledBoxes("accounts").length) reason = "无可用账号";
   else if (!n) reason = "未选账号";
-  else if (n > 24) reason = "最多选 24 个账号";
+  else if (n > accountLimit) reason = `最多选 ${accountLimit} 个账号`;
   else if (!q) reason = "未选挑战题";
   start.disabled = Boolean(reason);
   $("estimate").textContent =
@@ -212,15 +229,49 @@ const statusNames = new Map([
   ["error", "异常"],
   ["expired", "过期"],
 ]);
-async function accounts() {
-  readyAccounts = false;
-  $("accountInfo").textContent = "读取中…";
+function filterAccounts() {
+  const term = $("accountSearch").value.trim().toLowerCase();
+  const availableOnly = $("availableOnly").checked;
+  const rows = Array.from($("accounts").querySelectorAll(".choice"));
+  for (const row of rows) {
+    row.hidden = !row.dataset.search.includes(term) ||
+      (availableOnly && row.querySelector("input").disabled);
+  }
+  show("accountNoMatches", rows.length > 0 && rows.every((row) => row.hidden));
   updateStart();
-  const { accounts: list } = await api("/api/accounts");
-  if (!session.logged_in) return;
+}
+function accounts() {
+  if (accountRequest) return accountRequest;
+  const request = loadAccounts(session.csrf).finally(() => {
+    if (accountRequest === request) accountRequest = null;
+  });
+  accountRequest = request;
+  return request;
+}
+async function loadAccounts(csrf) {
+  const info = $("accountInfo");
+  const previousInfo = info.textContent;
+  const wasReady = readyAccounts;
+  readyAccounts = false;
+  info.textContent = "读取中…";
+  updateStart();
+  try {
+    const { accounts: list } = await api("/api/accounts");
+    if (!session.logged_in || session.csrf !== csrf) return;
+    renderAccounts(list);
+  } catch (error) {
+    if (!session.logged_in || session.csrf !== csrf) return;
+    readyAccounts = wasReady;
+    info.textContent = wasReady ? previousInfo : "读取失败";
+    updateStart();
+    throw error;
+  }
+}
+function renderAccounts(list) {
   const selected = new Set(checked("accounts"));
   const rows = list.map((item) => {
     const row = el("label", null, "choice");
+    row.dataset.search = `${item.name || ""} #${item.id}`.toLowerCase();
     const main = el("span", null, "choice-main");
     const titleLine = el("span", null, "choice-title");
     titleLine.append(
@@ -272,24 +323,40 @@ async function accounts() {
   const eligibleCount = list.filter((item) => item.eligible).length;
   $("accountInfo").textContent = `${eligibleCount}/${list.length} 可用`;
   readyAccounts = true;
-  updateStart();
+  filterAccounts();
 }
 async function questions() {
+  const csrf = session.csrf;
+  const wasReady = readyQuestions;
+  const previous = $("questions").querySelector("input")?.value;
+  const refresh = $("refreshQuestions");
+  refresh.disabled = true;
   readyQuestions = false;
   updateStart();
-  const { questions: list } = await api("/api/questions");
-  if (!session.logged_in) return;
-  const rows = list.map((item, index) => {
-    const choice = el("label", null, "q-card");
-    choice.append(
-      checkbox(item.id, index < 3, false),
-      el("span", `挑战 ${item.number ?? index + 1}`, "name"),
-    );
-    return choice;
-  });
-  $("questions").replaceChildren(...rows);
-  readyQuestions = list.length > 0 && list.length <= 3;
-  updateStart();
+  try {
+    const path = previous ? `/api/questions?previous=${encodeURIComponent(previous)}` : "/api/questions";
+    const { questions: list } = await api(path);
+    if (!session.logged_in || session.csrf !== csrf) return;
+    const rows = list.map((item, index) => {
+      const choice = el("label", null, "q-card");
+      choice.append(
+        checkbox(item.id, index < 3, false),
+        el("span", `挑战 ${item.number ?? index + 1}`, "name"),
+      );
+      return choice;
+    });
+    $("questions").replaceChildren(...rows);
+    readyQuestions = list.length > 0 && list.length <= 3;
+  } catch (error) {
+    if (!session.logged_in || session.csrf !== csrf) return;
+    readyQuestions = wasReady;
+    throw error;
+  } finally {
+    if (session.logged_in && session.csrf === csrf) {
+      refresh.disabled = refresh.hasAttribute("aria-busy");
+      updateStart();
+    }
+  }
 }
 const stopPoll = () => clearTimeout(pollTimer);
 function selectRun(id, alreadyActive = false) {
@@ -329,7 +396,7 @@ async function currentRun() {
   if (latest && viewed === latest) return poll(version);
   return selectRun(latest, active(runs[0]?.state));
 }
-async function poll(version) {
+async function poll(version, retryDelay = 3000) {
   const runID = viewed;
   const sequence = ++pollSequence;
   if (!session.logged_in || !runID || version !== revision) return;
@@ -338,6 +405,7 @@ async function poll(version) {
     const run = await api(`/api/runs/${runID}`);
     if (version !== revision || sequence !== pollSequence || !session.logged_in)
       return;
+    if ($("notice").textContent === pollRetryNotice) notice();
     const imprint = JSON.stringify(run);
     if (imprint !== lastRender) {
       renderRun($("result"), run, bank, session.bank_version);
@@ -361,6 +429,12 @@ async function poll(version) {
     if (error.status === 404) {
       selectRun("");
       notice("服务器已清除本次检测结果。");
+    } else if (
+      error.code === "NETWORK" || error.status === 408 ||
+      error.status === 429 || error.status >= 500
+    ) {
+      notice(pollRetryNotice);
+      pollTimer = setTimeout(() => poll(version, Math.min(retryDelay * 2, 15000)), retryDelay);
     } else {
       await failure(error);
     }
@@ -387,7 +461,12 @@ async function prepareBank() {
   if (session.logged_in && lastRender)
     renderRun($("result"), JSON.parse(lastRender), bank, session.bank_version);
 }
-async function initialize() {
+function initialize() {
+  return (initializing ??= loadPage().finally(() => {
+    initializing = null;
+  }));
+}
+async function loadPage() {
   show("reconnect", false);
   try {
     session = await api("/api/session");
@@ -466,10 +545,12 @@ async function submitRun() {
 for (const id of ["accounts", "questions"])
   $(id).addEventListener("change", updateStart);
 $("selectAllAccounts").addEventListener("click", () => {
-  const boxes = enabledBoxes("accounts");
-  const next = !boxes.every((box) => box.checked);
-  for (const box of boxes.slice(0, 24)) box.checked = next;
-  if (!next) for (const box of boxes) box.checked = false;
+  const { selected, add } = accountSelection();
+  if (add.length) {
+    for (const box of add) box.checked = true;
+  } else {
+    for (const box of selected) box.checked = false;
+  }
   updateStart();
 });
 $("selectAllQuestions").addEventListener("click", () => {
@@ -487,6 +568,9 @@ action($("stepForm"), "submit", async () => {
   notice("二次验证已完成。");
 });
 action($("refreshAccounts"), "click", accounts);
+action($("refreshQuestions"), "click", questions);
+$("accountSearch").addEventListener("input", filterAccounts);
+$("availableOnly").addEventListener("change", filterAccounts);
 action($("reloadResults"), "click", currentRun);
 action($("retryBank"), "click", prepareBank);
 action($("runForm"), "submit", submitRun);
@@ -495,6 +579,25 @@ action($("cancel"), "click", async () => {
   await poll(revision);
 });
 action($("reconnect"), "click", initialize);
+async function reconnectFromSub2() {
+  if (initializing) await initializing.catch(() => {});
+  if (!session.logged_in && !sharedToken()) return;
+  try {
+    await syncSession();
+  } catch (error) {
+    show("reconnect", true);
+    notice(error.message, true);
+  }
+}
+window.addEventListener("storage", (event) => {
+  if (event.key === "auth_token" || event.key === null) void reconnectFromSub2();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !session.logged_in) void reconnectFromSub2();
+});
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) void reconnectFromSub2();
+});
 initialize().catch(async (error) => {
   show("reconnect", true);
   await failure(error);

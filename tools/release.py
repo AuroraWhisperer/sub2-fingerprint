@@ -60,15 +60,14 @@ def main():
                         '-ldflags=-s -w -buildid= -H=windowsgui', '-o', str(launcher), './cmd/detector-launcher'],
                        cwd=ROOT, env=env, check=True)
         artifact = out / 'sub2-fingerprint-windows-amd64.zip'
-        members = {launcher.name: launcher.read_bytes(), 'launcher.example.json': (ROOT/'launcher.example.json').read_bytes(),
-                   'README.md': (ROOT/'README.md').read_bytes(), 'VERSION': files['VERSION'],
+        members = {launcher.name: launcher.read_bytes(), 'README.md': (ROOT/'README.md').read_bytes(), 'VERSION': files['VERSION'],
                    'LICENSES/Go.txt': files['LICENSES/Go.txt'], 'LICENSES/Go-PATENTS.txt': files['LICENSES/Go-PATENTS.txt']}
         with zipfile.ZipFile(artifact, 'w') as archive:
             for name, data in sorted(members.items()):
                 entry = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
                 entry.create_system = 3
                 entry.external_attr = 0o100644 << 16
-                archive.writestr(entry, data, compress_type=zipfile.ZIP_STORED)
+                archive.writestr(entry, data, compress_type=zipfile.ZIP_DEFLATED)
         checks.append(sha(artifact.read_bytes())+'  '+artifact.name+'\n')
     (out/'SHA256SUMS.txt').write_bytes(''.join(checks).encode())
     print('Built',version,'in',out)

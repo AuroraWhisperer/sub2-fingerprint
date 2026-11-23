@@ -528,24 +528,6 @@ main {
   max-width: 440px;
 }
 
-.update-panel {
-  margin-bottom: 20px;
-}
-
-.update-panel p {
-  margin: 10px 0;
-  max-width: 72ch;
-  overflow-wrap: anywhere;
-}
-
-.update-panel .error {
-  color: var(--danger);
-}
-
-.update-panel .update-actions {
-  margin-top: 16px;
-}
-
 .narrow .muted {
   margin: 8px 0 20px;
 }
@@ -865,6 +847,24 @@ button.primary:disabled:not([aria-busy="true"]),
   line-height: 1.2;
   margin-right: 2px;
   padding-right: 8px;
+}
+
+.account-filters {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.account-filters .field {
+  flex: 1 1 150px;
+}
+
+.available-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 button.link,

@@ -121,7 +121,7 @@ func TestQueueRetries503WhenSwitchingAccounts(t *testing.T) {
 		Accounts: []int64{1, 2}, Questions: []string{"q1", "q2", "q3"}, Parallel: 1,
 	}
 	questions := []Question{{ID: "q1", Prompt: "q1"}, {ID: "q2", Prompt: "q2"}, {ID: "q3", Prompt: "q3"}}
-	if err := q.start(context.Background(), 7, "jwt", req,
+	if err := q.start(context.Background(), 7, fixedJWT("jwt"), req,
 		map[int64]AccountView{1: {ID: 1, Name: "first"}, 2: {ID: 2, Name: "second"}}, questions); err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestProbeRetries503WithinOneGroupTransaction(t *testing.T) {
 		fmt.Fprint(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"42\"}\n\n")
 		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n")
 	}
-	answer, err := f.adapter.Probe(context.Background(), "admin-fixture", 1, "retry me")
+	answer, err := f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "retry me")
 	if err != nil || answer.Text != "42" || f.gatewayCalls.Load() != 3 {
 		t.Fatalf("unexpected retry result: answer=%+v err=%v attempts=%d", answer, err, f.gatewayCalls.Load())
 	}
@@ -223,7 +223,7 @@ func TestProbeDoesNotRetryOtherFailures(t *testing.T) {
 					w.WriteHeader(tc.status)
 					fmt.Fprint(w, tc.body)
 				}
-				_, err := f.adapter.Probe(context.Background(), "admin-fixture", 1, "do not replay")
+				_, err := f.adapter.Probe(context.Background(), fixedJWT("admin-fixture"), 1, "do not replay")
 				assertGate(t, err, tc.code)
 				wantAttempts := int32(1)
 				if transientFirst {
@@ -258,7 +258,7 @@ func TestProbeRetryWaitHonorsContextAndRestoresGroups(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() {
-				_, err := f.adapter.Probe(ctx, "admin-fixture", 1, "stop waiting")
+				_, err := f.adapter.Probe(ctx, fixedJWT("admin-fixture"), 1, "stop waiting")
 				done <- err
 			}()
 			select {

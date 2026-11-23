@@ -15,6 +15,46 @@ func (m *isolatedSub2) Refresh(context.Context, string) (LoginResult, error) {
 }
 func (m *isolatedSub2) VerifyAdmin(context.Context, string, int64) error { return nil }
 
+func TestExternalSessionRenewalUpdatesRunCredential(t *testing.T) {
+	a, _ := testApp(t)
+	b := testBrowser{t: t, a: a, token: "original"}
+	if code, _, _ := b.call("GET", "/api/session", nil, ""); code != 200 {
+		t.Fatal(code)
+	}
+	s := a.sessions[cookieKey(b.cookie.Value)]
+	if _, deadline := s.ctx.Deadline(); deadline || !s.external {
+		t.Fatal("external session was published with a fixed deadline or missing source")
+	}
+	credential := s.probeJWT
+	b.token = "renewed"
+	if code, _, _ := b.call("GET", "/api/session", nil, ""); code != 200 || *credential.Load() != b.token {
+		t.Fatal("renewal did not update the original credential slot")
+	}
+	if s.ctx.Err() != nil {
+		t.Fatal("renewal cancelled the session")
+	}
+	s.mu.Lock()
+	a.mu.Lock()
+	s.end = time.Now().Add(-time.Second)
+	a.mu.Unlock()
+	s.mu.Unlock()
+	a.prune()
+	if s.ctx.Err() != context.Canceled {
+		t.Fatal("expiration did not cancel session work")
+	}
+}
+
+func TestPostWithoutCookieDoesNotCreateExternalSession(t *testing.T) {
+	a, _ := testApp(t)
+	b := testBrowser{t: t, a: a, token: "external-admin"}
+	if code, out, _ := b.post("/api/runs", struct{}{}); code != 403 || out["code"] != "CSRF" {
+		t.Fatal(code, out)
+	}
+	if b.cookie != nil || len(a.sessions) != 0 {
+		t.Fatal("rejected POST allocated a session")
+	}
+}
+
 type loginTestAPI struct {
 	*isolatedSub2
 	muLogin           sync.Mutex

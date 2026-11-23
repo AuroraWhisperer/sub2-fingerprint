@@ -30,7 +30,7 @@ func newIsolatedSub2() *isolatedSub2 {
 }
 func (m *isolatedSub2) Login(_ context.Context, email, pw string) (LoginResult, error) {
 	if pw != "fixture-password" {
-		return LoginResult{}, &GateError{"UNAUTHORIZED", "未授权"}
+		return LoginResult{}, gate("UNAUTHORIZED", "未授权")
 	}
 	if email == "user@example.com" {
 		return LoginResult{JWT: "mock-non-admin", UserID: 13}, nil
@@ -42,7 +42,7 @@ func (m *isolatedSub2) Login(_ context.Context, email, pw string) (LoginResult, 
 }
 func (m *isolatedSub2) Login2FA(_ context.Context, tmp, code string) (LoginResult, error) {
 	if tmp != "mock-login-challenge" || code != "123456" {
-		return LoginResult{}, &GateError{"UNAUTHORIZED", "验证码无效"}
+		return LoginResult{}, gate("UNAUTHORIZED", "验证码无效")
 	}
 	return LoginResult{JWT: "mock-second-admin", UserID: 12, Admin: true}, nil
 }
@@ -55,7 +55,7 @@ func (m *isolatedSub2) CurrentAdmin(_ context.Context, token string) (int64, err
 }
 func (m *isolatedSub2) StepUp(context.Context, string, string) error        { return nil }
 func (m *isolatedSub2) List(context.Context, string) ([]AccountView, error) { return m.listed, nil }
-func (m *isolatedSub2) Probe(ctx context.Context, jwt string, id int64, prompt string) (ProbeAnswer, error) {
+func (m *isolatedSub2) Probe(ctx context.Context, _ probeToken, id int64, prompt string) (ProbeAnswer, error) {
 	m.mu.Lock()
 	m.calls[id]++
 	m.in[id]++
@@ -128,6 +128,28 @@ func testApp(t *testing.T) (*app, *isolatedSub2) {
 	t.Helper()
 	return testAppWithParallel(t, 1)
 }
+
+func TestOnlyCurrentFingerprintBankIsCacheable(t *testing.T) {
+	a, _ := testApp(t)
+	const bankPath = "/unified_bank.json"
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{bankPath + "?v=" + a.bankVersion, "private, max-age=31536000, immutable"},
+		{bankPath, "no-store"},
+		{bankPath + "?v=old", "no-store"},
+		{"/api/session?v=" + a.bankVersion, "no-store"},
+	} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "http://"+a.cfg.Listen+tc.path, nil)
+		a.ServeHTTP(w, r)
+		if w.Code != http.StatusOK || w.Header().Get("Cache-Control") != tc.want {
+			t.Errorf("%s: status %d, Cache-Control %q, want 200 and %q", tc.path, w.Code, w.Header().Get("Cache-Control"), tc.want)
+		}
+	}
+}
+
 func testAppWithParallel(t *testing.T, parallel int) (*app, *isolatedSub2) {
 	t.Helper()
 	t.Setenv("STATE_DIRECTORY", filepath.Join(t.TempDir(), "auth"))
@@ -374,7 +396,7 @@ func TestCancelAndRestartClearResults(t *testing.T) {
 	id := "1eee2222-0000-4000-8000-000000000002"
 	qs := []Question{{ID: "q1", Prompt: "one"}, {ID: "q2", Prompt: "two"}}
 	req := RunRequest{ID: id, Accounts: []int64{101}, Questions: []string{"q1", "q2"}, Parallel: 1}
-	if err := q.start(context.Background(), 11, "fixture", req, map[int64]AccountView{101: m.listed[0]}, qs); err != nil {
+	if err := q.start(context.Background(), 11, fixedJWT("fixture"), req, map[int64]AccountView{101: m.listed[0]}, qs); err != nil {
 		t.Fatal(err)
 	}
 	waitStart(t, m)
@@ -417,7 +439,7 @@ func TestCancelAndRestartClearResults(t *testing.T) {
 func TestRetiredAndDuplicateSubmissionsDoNotReplay(t *testing.T) {
 	dir := t.TempDir()
 	calls := 0
-	q, err := openQueue(dir, "fixture-bank", func(ctx context.Context, jwt string, id int64, prompt string) (ProbeAnswer, error) {
+	q, err := openQueue(dir, "fixture-bank", func(ctx context.Context, _ probeToken, id int64, prompt string) (ProbeAnswer, error) {
 		calls++
 		return ProbeAnswer{Text: "private fixture answer"}, nil
 	})
@@ -430,7 +452,9 @@ func TestRetiredAndDuplicateSubmissionsDoNotReplay(t *testing.T) {
 	a := RunRequest{ID: "1eee2222-0000-4000-8000-000000000011", Epoch: "process", Accounts: []int64{1}, Questions: []string{"q"}, Parallel: 1}
 	b := a
 	b.ID = "1eee2222-0000-4000-8000-000000000012"
-	start := func(req RunRequest) error { return q.start(context.Background(), 3, "fixture", req, accounts, qs) }
+	start := func(req RunRequest) error {
+		return q.start(context.Background(), 3, fixedJWT("fixture"), req, accounts, qs)
+	}
 	if err := start(a); err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +535,7 @@ func TestRejectedQuestionDoesNotSuppressIndependentChallenge(t *testing.T) {
 		{"UPSTREAM_REFUSAL", "done"}, {"UPSTREAM_INCOMPLETE", "done"}, {"UPSTREAM_INPUT", "done"}, {"UPSTREAM_RATE_LIMIT", "failed"},
 	} {
 		t.Run(tc.code, func(t *testing.T) {
-			q, err := openQueue(t.TempDir(), "fixture-bank", func(ctx context.Context, jwt string, id int64, prompt string) (ProbeAnswer, error) {
+			q, err := openQueue(t.TempDir(), "fixture-bank", func(ctx context.Context, _ probeToken, id int64, prompt string) (ProbeAnswer, error) {
 				if prompt == "first" {
 					return ProbeAnswer{}, gate(tc.code, "fixture failure")
 				}
@@ -523,7 +547,7 @@ func TestRejectedQuestionDoesNotSuppressIndependentChallenge(t *testing.T) {
 			defer q.close()
 			req := RunRequest{ID: "1eee2222-0000-4000-8000-000000000004", Parallel: 1, Accounts: []int64{7}, Questions: []string{"q1", "q2"}}
 			qs := []Question{{ID: "q1", Prompt: "first"}, {ID: "q2", Prompt: "second"}}
-			if err := q.start(context.Background(), 11, "fixture", req, map[int64]AccountView{7: {ID: 7, Name: "demo"}}, qs); err != nil {
+			if err := q.start(context.Background(), 11, fixedJWT("fixture"), req, map[int64]AccountView{7: {ID: 7, Name: "demo"}}, qs); err != nil {
 				t.Fatal(err)
 			}
 			r := waitRun(t, q, 11, req.ID)
